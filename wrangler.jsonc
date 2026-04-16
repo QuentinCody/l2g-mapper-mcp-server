@@ -1,0 +1,56 @@
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "l2g-mapper-mcp-server",
+	"main": "src/index.ts",
+	"compatibility_date": "2025-03-10",
+	"compatibility_flags": [
+		"nodejs_compat"
+	],
+	"alias": {
+		"ai": "./src/ai-stub.ts"
+	},
+	"migrations": [
+		{
+			"new_sqlite_classes": [
+				"L2gDataDO"
+			],
+			"tag": "v1"
+		},
+		{
+			"new_sqlite_classes": [
+				"MyMCP"
+			],
+			"tag": "v2"
+		},
+		{
+			"tag": "v3-purge-mymcp",
+			"deleted_classes": [
+				"MyMCP"
+			]
+		},
+		{
+			"tag": "v4-readd-mymcp",
+			"new_sqlite_classes": [
+				"MyMCP"
+			]
+		}
+	],
+	"durable_objects": {
+		"bindings": [
+			{
+				"class_name": "L2gDataDO",
+				"name": "L2G_DATA_DO"
+			},
+			{
+				"class_name": "MyMCP",
+				"name": "MCP_OBJECT"
+			}
+		]
+	},
+	"observability": {
+		"enabled": true
+	},
+	"dev": {
+		"port": 8892
+	}
+}
