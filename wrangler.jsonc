@@ -21,18 +21,6 @@
 				"MyMCP"
 			],
 			"tag": "v2"
-		},
-		{
-			"tag": "v3-purge-mymcp",
-			"deleted_classes": [
-				"MyMCP"
-			]
-		},
-		{
-			"tag": "v4-readd-mymcp",
-			"new_sqlite_classes": [
-				"MyMCP"
-			]
 		}
 	],
 	"durable_objects": {

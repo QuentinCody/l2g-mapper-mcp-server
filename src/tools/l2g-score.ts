@@ -99,6 +99,63 @@ async function selectAll<T>(
 	}
 }
 
+/**
+ * Preflight check: distinguishes three failure modes so error messages are
+ * truthful instead of defaulting to "No anchors remained".
+ *   - DO has zero user tables        → unknown/empty data_access_id
+ *   - DO has tables but no `anchors` → gather produced no anchors (QC)
+ *   - DO has `anchors`                → proceed with normal scoring
+ */
+async function preflightDao(
+	doNamespace: DurableObjectNamespace,
+	dataAccessId: string,
+): Promise<{ ok: boolean; message: string }> {
+	try {
+		const doId = doNamespace.idFromName(dataAccessId);
+		const doInstance = doNamespace.get(doId);
+		const resp = await doInstance.fetch(new Request("http://localhost/schema"));
+		if (!resp.ok) {
+			return {
+				ok: false,
+				message: `Unable to resolve data_access_id=${dataAccessId} (DO /schema returned HTTP ${resp.status}). Re-run l2g_gather first.`,
+			};
+		}
+		// DO /schema returns { success, schema: { tables: { "tblName": {...}, ... }, table_count, ... } }
+		// NOT an array. The legacy shape check assumed an array and always
+		// resolved to 0 user tables, making every preflight report
+		// "has no staged gather output (found tables: none)".
+		const body = (await resp.json()) as {
+			schema?: { tables?: Record<string, unknown> };
+			data?: { schema?: { tables?: Record<string, unknown> } };
+		};
+		const tablesMap =
+			body.schema?.tables ?? body.data?.schema?.tables ?? {};
+		const userTables = Object.keys(tablesMap).filter(
+			(n) =>
+				typeof n === "string" &&
+				!n.startsWith("_") &&
+				!n.startsWith("sqlite_") &&
+				!n.startsWith("_staging_"),
+		);
+		if (userTables.length === 0 || (userTables.length === 1 && userTables[0] === "l2g_meta")) {
+			return {
+				ok: false,
+				message: `data_access_id=${dataAccessId} has no staged gather output (found tables: ${userTables.join(", ") || "none"}). Run l2g_gather first or double-check the id.`,
+			};
+		}
+		if (!userTables.includes("anchors")) {
+			return {
+				ok: false,
+				message: `data_access_id=${dataAccessId} is populated but has no anchors table (found: ${userTables.join(", ")}). The gather phase produced no anchor variants — revise trait_query/seed_rsids and re-run l2g_gather.`,
+			};
+		}
+		return { ok: true, message: "" };
+	} catch (err) {
+		const msg = err instanceof Error ? err.message : String(err);
+		return { ok: false, message: `Preflight failed: ${msg}` };
+	}
+}
+
 export function registerL2gScore(server: McpServer, env?: ScoreEnv): void {
 	const handler = async (args: Record<string, unknown>, extra: unknown) => {
 		const runtimeEnv = env || (extra as { env?: ScoreEnv })?.env;
@@ -119,6 +176,14 @@ export function registerL2gScore(server: McpServer, env?: ScoreEnv): void {
 				burden: Number(overrides.burden ?? WEIGHTS.burden),
 				coding: Number(overrides.coding ?? WEIGHTS.coding),
 			};
+
+			// Preflight: confirm the DAI resolves to a DO that was populated by
+			// l2g_gather. Distinguishes between "unknown DAI" (user typo, new
+			// session) and "anchors table is genuinely empty" (real no-hits).
+			const preflight = await preflightDao(doNamespace, dataAccessId);
+			if (!preflight.ok) {
+				return createCodeModeError("DATA_ACCESS_ERROR", preflight.message);
+			}
 
 			const anchors = await selectAll<AnchorRow>(
 				doNamespace,

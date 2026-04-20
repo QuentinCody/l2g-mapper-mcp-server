@@ -66,7 +66,16 @@ export interface SparqlExecuteToolResult {
 	name: string;
 	description: string;
 	schema: { code: z.ZodString };
-	register: (server: { tool: (...args: unknown[]) => void }) => void;
+	/**
+	 * Register the tool on the MCP server. When `probeEagerly` is true (default),
+	 * this awaits a one-shot endpoint probe before calling `server.tool(...)` so
+	 * that `tools/list` returns the real endpoint shape in the description
+	 * instead of the "not yet probed" fallback.
+	 */
+	register: (
+		server: { tool: (...args: unknown[]) => void },
+		opts?: { probeEagerly?: boolean },
+	) => Promise<void>;
 }
 
 function validateLoader(rawLoader: unknown): WorkerLoaderBinding {
@@ -181,7 +190,7 @@ interface ExecutionContext {
 	includeFsProxy: boolean;
 	sparqlProxySource: string;
 	prefixesSource: string;
-	executorFns: ExecutorFns;
+	buildExecutorFns: (sessionId: string | undefined) => ExecutorFns;
 	cache: {
 		description: SparqlEndpointDescription | undefined;
 		toolDescription: string | undefined;
@@ -210,7 +219,7 @@ async function ensureDescription(ctx: ExecutionContext): Promise<void> {
 	}
 }
 
-async function executeCode(ctx: ExecutionContext, code: string) {
+async function executeCode(ctx: ExecutionContext, code: string, sessionId: string | undefined) {
 	await ensureDescription(ctx);
 	const wrappedCode = wrapUserCode({
 		prefixesSource: ctx.prefixesSource,
@@ -220,40 +229,44 @@ async function executeCode(ctx: ExecutionContext, code: string) {
 		includeFsProxy: ctx.includeFsProxy,
 	});
 	const executor = new DynamicWorkerExecutor({ loader: ctx.loader, timeout: ctx.timeout });
-	const result = await executor.execute(wrappedCode, ctx.executorFns);
+	const result = await executor.execute(wrappedCode, ctx.buildExecutorFns(sessionId));
 	return handleExecutorResult(result);
 }
 
-function buildExecutorFns(
+function createExecutorFnsBuilder(
 	sparqlProxyTool: ReturnType<typeof createSparqlProxyTool>,
 	doNamespace: unknown,
 	prefix: string,
 	fsDoNamespace: unknown,
-): ExecutorFns {
-	const stubCtx: ToolContext = { sql: () => [] };
+): (sessionId: string | undefined) => ExecutorFns {
 	const queryProxyTool = doNamespace ? createQueryProxyTool({ doNamespace }) : undefined;
 	const stageProxyTool = doNamespace
 		? createStageProxyTool({ doNamespace, stagingPrefix: prefix })
 		: undefined;
-	return {
-		__sparql_proxy: async (args: unknown) => sparqlProxyTool.handler(toInput(args), stubCtx),
-		__query_proxy: async (args: unknown) => {
-			if (!queryProxyTool) {
-				return { __query_error: true, message: "Staged data querying is not available (no DO namespace configured)" };
-			}
-			return queryProxyTool.handler(toInput(args), stubCtx);
-		},
-		__stage_proxy: async (args: unknown) => {
-			if (!stageProxyTool) {
-				return { __stage_error: true, message: "Data staging is not available (no DO namespace configured)" };
-			}
-			return stageProxyTool.handler(toInput(args), stubCtx);
-		},
-		...(fsDoNamespace
-			? createFsProxyHandlers({
-					doNamespace: fsDoNamespace as Parameters<typeof createFsProxyHandlers>[0]["doNamespace"],
-				})
-			: {}),
+	const fsHandlers: ExecutorFns = fsDoNamespace
+		? createFsProxyHandlers({
+				doNamespace: fsDoNamespace as Parameters<typeof createFsProxyHandlers>[0]["doNamespace"],
+			})
+		: {};
+
+	return (sessionId: string | undefined) => {
+		const ctx: ToolContext = { sql: () => [], sessionId };
+		return {
+			__sparql_proxy: async (args: unknown) => sparqlProxyTool.handler(toInput(args), ctx),
+			__query_proxy: async (args: unknown) => {
+				if (!queryProxyTool) {
+					return { __query_error: true, message: "Staged data querying is not available (no DO namespace configured)" };
+				}
+				return queryProxyTool.handler(toInput(args), ctx);
+			},
+			__stage_proxy: async (args: unknown) => {
+				if (!stageProxyTool) {
+					return { __stage_error: true, message: "Data staging is not available (no DO namespace configured)" };
+				}
+				return stageProxyTool.handler(toInput(args), ctx);
+			},
+			...fsHandlers,
+		};
 	};
 }
 
@@ -278,7 +291,7 @@ export function createSparqlExecuteTool(options: SparqlExecuteToolOptions): Spar
 		stagingPrefix: prefix,
 		stagingThreshold,
 	});
-	const executorFns = buildExecutorFns(sparqlProxyTool, doNamespace, prefix, fsDoNamespace);
+	const buildExecutorFns = createExecutorFnsBuilder(sparqlProxyTool, doNamespace, prefix, fsDoNamespace);
 
 	const ctx: ExecutionContext = {
 		sparqlFetch,
@@ -289,7 +302,7 @@ export function createSparqlExecuteTool(options: SparqlExecuteToolOptions): Spar
 		includeFsProxy: !!fsDoNamespace,
 		sparqlProxySource: buildSparqlProxySource(),
 		prefixesSource: buildPrefixesSource(prefixes),
-		executorFns,
+		buildExecutorFns,
 		cache: { description: options.description, toolDescription: undefined },
 	};
 
@@ -306,14 +319,23 @@ export function createSparqlExecuteTool(options: SparqlExecuteToolOptions): Spar
 			),
 		},
 
-		register(server: { tool: (...args: unknown[]) => void }) {
-			server.tool(toolName, this.description, this.schema, async (input: { code: string }) => {
+		async register(
+			server: { tool: (...args: unknown[]) => void },
+			_opts?: { probeEagerly?: boolean; probeTimeoutMs?: number },
+		) {
+			// NOTE: `probeEagerly` was experimental — in practice probing the
+			// SPARQL endpoint during init added 10-15s to cold session startup
+			// (Bgee's Virtuoso is slow on VOID/probe queries). The shape is
+			// still probed lazily on first execute and cached thereafter; the
+			// tool description carries the standard guidance instead.
+			server.tool(toolName, this.description, this.schema, async (input: { code: string }, extra: unknown) => {
 				const code = input.code?.trim();
 				if (!code) {
 					return createCodeModeError(ErrorCodes.INVALID_ARGUMENTS, "code is required");
 				}
 				try {
-					return await executeCode(ctx, code);
+					const sessionId = (extra as { sessionId?: string } | undefined)?.sessionId;
+					return await executeCode(ctx, code, sessionId);
 				} catch (err) {
 					const message = err instanceof Error ? err.message : String(err);
 					return createCodeModeError(ErrorCodes.UNKNOWN_ERROR, `${prefix}_execute failed: ${message}`);

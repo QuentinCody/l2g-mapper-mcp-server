@@ -41,6 +41,15 @@ export function locusGeneHeatmap(cells: HeatmapCell[]): MermaidFigure {
 	lines.push("  classDef lo fill:#e0f3f8,color:#000,stroke:#aaa,stroke-width:1px");
 	lines.push("  classDef zr fill:#f7f7f7,color:#999,stroke:#ddd,stroke-width:1px");
 
+	if (genes.length === 0 || cols.length === 0) {
+		lines.push("  EMPTY[\"No heatmap data — gather phase produced no scored candidate genes.\"]:::zr");
+		return {
+			id: "locus_gene_heatmap",
+			mermaid: lines.join("\n"),
+			caption: "Top candidate genes by evidence component (empty — no data).",
+		};
+	}
+
 	// Header row
 	const headerIds = cols.map((c, i) => `H${i}`);
 	headerIds.forEach((hid, i) => {
@@ -113,6 +122,15 @@ export function tissueSupportDotplot(dots: TissueDot[]): MermaidFigure {
 	lines.push("flowchart LR");
 	lines.push("  classDef yes fill:#4575b4,color:#fff,stroke:#333");
 	lines.push("  classDef no  fill:#f7f7f7,color:#999,stroke:#ddd");
+
+	if (genes.length === 0 || tissues.length === 0) {
+		lines.push("  EMPTY[\"No tissue support — GTEx eQTL lane returned no hits (may be upstream rate-limit or no eQTL evidence for the anchors).\"]:::no");
+		return {
+			id: "tissue_support_dotplot",
+			mermaid: lines.join("\n"),
+			caption: "Gene × tissue evidence (empty — no eQTL/HPA support data available).",
+		};
+	}
 
 	tissues.forEach((t, ti) => {
 		lines.push(`  T${ti}["${t}"]:::no`);

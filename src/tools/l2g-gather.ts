@@ -713,25 +713,42 @@ export function registerL2gGather(server: McpServer, env?: GatherEnv): void {
 				}
 			}
 
-			// Project subrequest budget up front
-			// Rough estimate: OLS4 (1) + GWAS anchors (1) + per-anchor coord lookup (2 per)
-			// + OT study search (<= trait_terms) + OT credible-sets/study + OT batch details
-			// + GTEx (1 call) + ClinVar (2 per anchor) + gnomAD (<=40) + HPA (<=20)
-			// + Genebass (<= entries*burden_sets)
-			const anchorBudget = Math.min(parsed.max_loci, Math.max(seedRsids.length, parsed.max_anchor_associations > 0 ? 15 : 0));
-			const coordBudget = anchorBudget * 2;
-			const otBudget = 20 + 6 + Math.ceil(anchorBudget / 40);
-			const gtexBudget = 1;
-			const clinvarBudget = parsed.include_clinvar ? anchorBudget * 2 + 1 : 0;
-			const gnomadBudget = parsed.include_gnomad_context ? 40 : 0;
-			const hpaBudget = parsed.include_hpa_tissue_context ? 20 : 0;
-			const genebassBudget = 25 * parsed.genebass_burden_sets.length;
+			// Project subrequest budget up front.
+			// Upper bounds reflect the worst-case fan-out per stage assuming every
+			// anchor survives normalization and every candidate gene is queried.
+			// The previous formula under-counted by ~4-5× because it used
+			// max_loci as the anchor ceiling instead of max_anchor_associations,
+			// and ignored per-candidate gnomAD/HPA fan-out.
+			const anchorCeiling = Math.min(
+				parsed.max_anchor_associations,
+				Math.max(seedRsids.length, parsed.max_loci * 4),
+			);
+			const candidateGenesCeiling = parsed.max_loci * parsed.max_genes_per_locus;
+			const coordBudget = anchorCeiling * 2;
+			const otBudget =
+				15 + Math.ceil(anchorCeiling / 40) * 3 + Math.ceil(parsed.max_loci / 5);
+			const gtexBudget = Math.max(1, Math.ceil(anchorCeiling / 40));
+			// ClinVar: esummary is batched ~20 ids per request
+			const clinvarBudget = parsed.include_clinvar
+				? Math.ceil(anchorCeiling / 20) + 1
+				: 0;
+			// gnomAD / HPA fan out per candidate gene
+			const gnomadBudget = parsed.include_gnomad_context ? candidateGenesCeiling : 0;
+			const hpaBudget = parsed.include_hpa_tissue_context ? candidateGenesCeiling : 0;
+			const genebassBudget = candidateGenesCeiling * parsed.genebass_burden_sets.length;
 			const projected =
-				2 + coordBudget + otBudget + gtexBudget + clinvarBudget + gnomadBudget + hpaBudget + genebassBudget;
+				2 +
+				coordBudget +
+				otBudget +
+				gtexBudget +
+				clinvarBudget +
+				gnomadBudget +
+				hpaBudget +
+				genebassBudget;
 			if (projected > 800) {
 				return createCodeModeError(
 					"INVALID_ARGUMENTS",
-					`Projected subrequest count (${projected}) exceeds 800. Reduce max_loci, max_anchor_associations, or drop optional lanes.`,
+					`Projected subrequest count (${projected}) exceeds the 800 Worker-subrequest budget. Reduce max_loci, max_genes_per_locus, max_anchor_associations, or drop optional lanes (include_clinvar/include_gnomad_context/include_hpa_tissue_context).`,
 				);
 			}
 

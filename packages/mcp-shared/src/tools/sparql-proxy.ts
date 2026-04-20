@@ -64,17 +64,33 @@ interface StagingConfig {
 	threshold: number | undefined;
 }
 
+type SparqlBinding = Record<
+	string,
+	{ value: string; type?: string; datatype?: string; "xml:lang"?: string }
+>;
+
 interface ParsedSparqlEnvelope {
-	bindings?: Array<Record<string, { value: string; type?: string; datatype?: string; "xml:lang"?: string }>>;
+	/** Virtuoso / SPARQL 1.1 JSON results shape */
+	head?: { vars?: string[]; link?: string[] };
+	results?: { bindings?: SparqlBinding[] };
+	/** ASK queries return { head: {}, boolean: true|false } */
 	boolean?: boolean;
 	[k: string]: unknown;
 }
 
+/**
+ * Flatten a SPARQL 1.1 JSON results envelope into row-shaped data for the
+ * staging engine. Bindings live at `results.bindings[]` (NOT top-level
+ * `bindings`); the staging engine's schema-inference v2 then produces one
+ * table with one column per SELECT variable.
+ *
+ * ASK queries (boolean) and CONSTRUCT/DESCRIBE (non-bindings) fall through
+ * unchanged — the staging engine handles them as-is.
+ */
 function shapeForStaging(parsed: ParsedSparqlEnvelope): unknown {
-	// For SELECT results: return the bindings array directly so the staging
-	// engine can detect tabular shape and create one row per binding.
-	if (Array.isArray(parsed?.bindings)) {
-		return parsed.bindings.map((b) => {
+	const bindings = parsed?.results?.bindings;
+	if (Array.isArray(bindings)) {
+		return bindings.map((b) => {
 			const row: Record<string, unknown> = {};
 			for (const [k, v] of Object.entries(b)) {
 				row[k] = v?.value ?? null;
@@ -88,6 +104,7 @@ function shapeForStaging(parsed: ParsedSparqlEnvelope): unknown {
 async function tryAutoStage(
 	envelope: ParsedSparqlEnvelope,
 	config: StagingConfig,
+	sessionId: string | undefined,
 ): Promise<Record<string, unknown> | undefined> {
 	const stageable = shapeForStaging(envelope);
 	const responseBytes = JSON.stringify(stageable).length;
@@ -102,6 +119,7 @@ async function tryAutoStage(
 		undefined,
 		undefined,
 		config.prefix,
+		sessionId,
 	);
 	const tableDetail = buildStagedTableSummary(staged);
 	const wrapper: Record<string, unknown> = {
@@ -124,9 +142,10 @@ async function executeAndMaybeStage(
 	format: string,
 	timeoutMs: number,
 	staging: StagingConfig,
+	sessionId: string | undefined,
 ): Promise<unknown> {
 	const raw = (await sparqlFetch(query, { method, format, timeoutMs })) as ParsedSparqlEnvelope;
-	const wrapper = await tryAutoStage(raw, staging);
+	const wrapper = await tryAutoStage(raw, staging, sessionId);
 	return wrapper ?? raw;
 }
 
@@ -147,7 +166,7 @@ export function createSparqlProxyTool(options: SparqlProxyToolOptions): ToolEntr
 			format: z.string().optional(),
 			timeoutMs: z.number().optional(),
 		},
-		handler: async (input) => {
+		handler: async (input, ctx) => {
 			const query = String(input.query || "");
 			if (!query) {
 				return { __sparql_error: true, code: "invalid_input", message: "query is required" };
@@ -163,6 +182,7 @@ export function createSparqlProxyTool(options: SparqlProxyToolOptions): ToolEntr
 					format,
 					timeoutMs,
 					staging,
+					ctx?.sessionId,
 				);
 			} catch (err) {
 				const message = err instanceof Error ? err.message : String(err);
