@@ -196,6 +196,14 @@ interface Ols4Response {
 	response?: { docs?: Ols4Doc[] };
 }
 
+function getCredibleSetRows(data: {
+	data?: { study?: { credibleSets?: { rows?: unknown[] } } };
+}): unknown[] {
+	const study = data?.data?.study;
+	const credibleSets = study?.credibleSets;
+	return credibleSets?.rows ?? [];
+}
+
 async function resolveEfo(
 	query: string,
 	warnings: string[],
@@ -372,7 +380,7 @@ async function fetchOpenTargetsBundle(
 		),
 	);
 	for (const cs of csResults) {
-		const rows = cs?.data?.study?.credibleSets?.rows ?? [];
+		const rows = getCredibleSetRows(cs);
 		for (const row of rows) {
 			if (!row.studyLocusId) continue;
 			const rsids = (row.variant?.rsIds ?? []).map((r) => r.toLowerCase());
