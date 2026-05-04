@@ -196,9 +196,14 @@ interface Ols4Response {
 	response?: { docs?: Ols4Doc[] };
 }
 
+interface CredibleSetRow {
+	studyLocusId?: string;
+	variant?: { rsIds?: string[] };
+}
+
 function getCredibleSetRows(data: {
-	data?: { study?: { credibleSets?: { rows?: unknown[] } } };
-}): unknown[] {
+	data?: { study?: { credibleSets?: { rows?: CredibleSetRow[] } } };
+}): CredibleSetRow[] {
 	const study = data?.data?.study;
 	const credibleSets = study?.credibleSets;
 	return credibleSets?.rows ?? [];

@@ -53,7 +53,7 @@ export function locusGeneHeatmap(cells: HeatmapCell[]): MermaidFigure {
 	// Header row
 	const headerIds = cols.map((c, i) => `H${i}`);
 	headerIds.forEach((hid, i) => {
-		lines.push(`  ${hid}[\"${cols[i]}\"]:::zr`);
+		lines.push(`  ${hid}["${cols[i]}"]:::zr`);
 	});
 	for (let i = 0; i < headerIds.length - 1; i++) {
 		lines.push(`  ${headerIds[i]} --- ${headerIds[i + 1]}`);
@@ -93,7 +93,7 @@ export function locusScoreDecomposition(rows: LocusDecomposition[]): MermaidFigu
 	const lines: string[] = [];
 	lines.push("xychart-beta");
 	lines.push("  title \"Top-gene score decomposition by locus\"");
-	const labels = rows.map((r) => `\"${r.locus_id}:${r.gene}\"`);
+	const labels = rows.map((r) => `"${r.locus_id}:${r.gene}"`);
 	lines.push(`  x-axis [${labels.join(", ")}]`);
 	lines.push("  y-axis \"component score (0..1)\" 0 --> 1");
 	const series = ["l2g", "coloc", "eqtl", "burden", "coding"] as const;
