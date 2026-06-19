@@ -996,7 +996,7 @@ export function registerL2gGather(server: McpServer, env?: GatherEnv): void {
 				undefined,
 				{ toolName: "l2g_gather", serverName: "l2g-mapper-mcp-server" },
 				"l2g",
-				(extra as { sessionId?: string })?.sessionId,
+				(extra as Record<string, unknown>),
 			);
 
 			// Also persist meta + warnings as a small side-table via second /process call.
@@ -1004,7 +1004,7 @@ export function registerL2gGather(server: McpServer, env?: GatherEnv): void {
 				const metaDoId = runtimeEnv.L2G_DATA_DO.idFromName(staged.dataAccessId);
 				const metaDo = runtimeEnv.L2G_DATA_DO.get(metaDoId);
 				await metaDo.fetch(
-					new Request("http://localhost/process", {
+					new Request("http://do.internal/process", {
 						method: "POST",
 						headers: { "Content-Type": "application/json" },
 						body: JSON.stringify({
