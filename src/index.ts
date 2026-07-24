@@ -1,3 +1,4 @@
+import { buildHealthResponse, configureCitationSigning } from "@bio-mcp/shared";
 import { McpAgent } from "agents/mcp";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { registerL2gGather } from "./tools/l2g-gather";
@@ -20,6 +21,8 @@ export class MyMCP extends McpAgent {
 	});
 
 	async init() {
+
+		configureCitationSigning(this.env);
 		const env = this.env as unknown as L2gEnv;
 		registerL2gGather(this.server, env);
 		registerL2gScore(this.server, env);
@@ -34,10 +37,7 @@ export default {
 		const url = new URL(request.url);
 
 		if (url.pathname === "/health") {
-			return new Response("ok", {
-				status: 200,
-				headers: { "content-type": "text/plain" },
-			});
+			return buildHealthResponse("l2g");
 		}
 
 		if (url.pathname === "/mcp") {
