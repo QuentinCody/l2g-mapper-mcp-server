@@ -21,6 +21,10 @@
 				"MyMCP"
 			],
 			"tag": "v2"
+		},
+		{
+			"tag": "mcp-2026-07-28-stateless",
+			"deleted_classes": ["MyMCP"]
 		}
 	],
 	"durable_objects": {
@@ -28,12 +32,7 @@
 			{
 				"class_name": "L2gDataDO",
 				"name": "L2G_DATA_DO"
-			},
-			{
-				"class_name": "MyMCP",
-				"name": "MCP_OBJECT"
-			}
-		]
+			}]
 	},
 	"observability": {
 		"enabled": true

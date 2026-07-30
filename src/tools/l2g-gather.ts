@@ -16,7 +16,7 @@
  * adapters in `packages/mcp-shared/src/adapters/`.
  */
 
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { McpServer } from "@bio-mcp/shared/mcp";
 import { z } from "zod";
 import {
 	createCodeModeResponse,

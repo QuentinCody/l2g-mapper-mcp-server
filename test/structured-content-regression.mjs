@@ -38,7 +38,7 @@ console.log(`${BLUE}🧪 L2G Mapper regression tests${RESET}`);
 // Tool registration
 const indexSrc = read("src/index.ts");
 assert("src/index.ts", indexSrc, "L2gDataDO", "index.ts exports L2gDataDO");
-assert("src/index.ts", indexSrc, "McpAgent", "index.ts uses McpAgent");
+assert("src/index.ts", indexSrc, "StatelessMcpWorker", "index.ts uses StatelessMcpWorker");
 assert("src/index.ts", indexSrc, "registerL2gGather", "index.ts wires l2g_gather");
 assert("src/index.ts", indexSrc, "registerL2gScore", "index.ts wires l2g_score");
 assert("src/index.ts", indexSrc, "registerL2gSynthesize", "index.ts wires l2g_synthesize");

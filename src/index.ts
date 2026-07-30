@@ -1,6 +1,6 @@
 import { buildHealthResponse, configureCitationSigning } from "@bio-mcp/shared";
-import { McpAgent } from "agents/mcp";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StatelessMcpWorker } from "@bio-mcp/shared/mcp";
+import { McpServer } from "@bio-mcp/shared/mcp";
 import { registerL2gGather } from "./tools/l2g-gather";
 import { registerL2gScore } from "./tools/l2g-score";
 import { registerL2gSynthesize } from "./tools/l2g-synthesize";
@@ -14,7 +14,7 @@ interface L2gEnv {
 	L2G_DATA_DO: DurableObjectNamespace;
 }
 
-export class MyMCP extends McpAgent {
+export class MyMCP extends StatelessMcpWorker {
 	server = new McpServer({
 		name: "l2g-mapper",
 		version: "0.1.0",
@@ -41,7 +41,7 @@ export default {
 		}
 
 		if (url.pathname === "/mcp") {
-			return MyMCP.serve("/mcp", { binding: "MCP_OBJECT" }).fetch(request, env, ctx);
+			return MyMCP.serve("/mcp").fetch(request, env, ctx);
 		}
 
 		return new Response("Not found", { status: 404 });
