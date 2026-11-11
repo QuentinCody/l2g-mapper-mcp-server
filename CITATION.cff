@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+message: "If you use this software in your work, please cite it. Citation is requested, not required."
+type: software
+title: "l2g-mapper-mcp-server"
+abstract: "A server of the Bio MCP fleet."
+authors:
+  - family-names: Cody
+    given-names: Quentin
+repository-code: "https://github.com/QuentinCody/l2g-mapper-mcp-server"
+license: Apache-2.0

@@ -17,46 +17,43 @@
  */
 
 import type { McpServer } from "@bio-mcp/shared/mcp";
-import { z } from "zod";
+import { inputSchema, gatherInputs } from "../lib/gather-inputs";
+import { projectedSubrequests } from "../lib/gather-budget";
 import {
-	createCodeModeResponse,
 	createCodeModeError,
 } from "@bio-mcp/shared/codemode/response";
-import { stageToDoAndRespond } from "@bio-mcp/shared/staging/utils";
-import { resolveRsid } from "@bio-mcp/shared/variants/resolve";
-import { ols4Search } from "@bio-mcp/shared/adapters/efo_ols4";
+import { selectCandidateGenes, type CandidateGene, type CandidateSelection } from "../lib/candidate-genes";
+import { withDeadline } from "../lib/with-deadline";
+import { stageGatherResult } from "../lib/gather-result";
+import { l2gResponse } from "../lib/tool-result";
+import type { CoordinateObservation } from "../lib/coordinates";
+import { gatherCoordinates } from "../lib/gather-coordinates";
+import { fetchGtexEqtls, type EqtlRow } from "../lib/gtex-evidence";
+import type { GtexObservation } from "../lib/gtex-observation";
+import { resolveTrait, type TraitResolution } from "../lib/trait-resolution";
+import { traitId } from "../lib/opentargets-traits";
 import { gwasAssociations } from "@bio-mcp/shared/adapters/gwas_catalog";
-import { opentargetsGraphql } from "@bio-mcp/shared/adapters/opentargets";
-import { gtexEqtlsByVariants } from "@bio-mcp/shared/adapters/gtex";
-import { clinvarEsearchByRsid, clinvarEsummary } from "@bio-mcp/shared/adapters/clinvar";
-import { gnomadGraphql } from "@bio-mcp/shared/adapters/gnomad";
-import { hpaGene } from "@bio-mcp/shared/adapters/hpa";
-import { genebassGeneBurden } from "@bio-mcp/shared/adapters/genebass";
+import { projectGwasAnchors } from "../lib/gwas-anchors";
+import { fetchOpenTargetsBundle, applyOpenTargetsBundle, type L2gPredictionRow, type ColocRow, type OpenTargetsEvidenceRow } from "../lib/opentargets-evidence";
+import { fetchClinvarLane, type ClinvarRow } from "../lib/clinvar-context";
+import { CLINVAR_CONTEXT_VERSION, type ClinvarObservation } from "../lib/clinvar-observation";
+import { fetchGnomadLane, GNOMAD_CONTEXT_VERSION, type GnomadRow } from "../lib/gnomad-context";
+import { fetchHpaLane, HPA_CONTEXT_VERSION, type HpaRow } from "../lib/hpa-context";
+import { fetchGenebassContext, type BurdenRow } from "../lib/genebass-context";
+import { GENEBASS_CONTEXT_VERSION, type GenebassObservation } from "../lib/genebass-observation";
+import { fetchBurdenEvidence } from "../lib/burden-evidence";
+import { fetchFinnGenContext, type FinnGenObservation } from "../lib/finngen-context";
+import { fetchFinnGenPhenotype, FINNGEN_JOIN_VERSION, type FinnGenPhenotypeObservation } from "../lib/finngen-phenotype";
+import { fetchEqtlCatalogueContext, type EqtlCatalogueObservation } from "../lib/eqtl-catalogue-context";
+import { EQTL_CATALOGUE_CONTEXT_VERSION } from "../lib/eqtl-catalogue-input";
+import { fetchEqtlR8Context, type EqtlR8Observation } from "../lib/eqtl-r8-context";
+import { EQTL_R8_CONTEXT_VERSION } from "../lib/eqtl-r8-input";
+import type { ParquetEnv } from "@bio-mcp/shared/adapters/eqtl/parquet";
 import { lookupDefaultSeeds } from "../lib/well-known-traits";
-
-interface GatherEnv {
+interface GatherEnv extends ParquetEnv {
 	L2G_DATA_DO?: DurableObjectNamespace;
 }
 
-const inputSchema = {
-	trait_query: z.string().optional().describe("Free-text trait label (e.g. 'type 2 diabetes')"),
-	efo_id: z.string().optional().describe("EFO term ID (e.g. 'EFO_0001360')"),
-	seed_rsids: z.array(z.string()).optional().describe("Seed lead rsIDs"),
-	target_gene: z.string().optional().describe("Optional gene of interest for highlighting"),
-	show_child_traits: z.boolean().default(true).optional(),
-	phenotype_terms: z.array(z.string()).optional(),
-	max_loci: z.number().int().positive().max(25).default(8).optional()
-		.describe("Max loci to analyse (synchronous cap; full-scope mode deferred)"),
-	max_genes_per_locus: z.number().int().positive().max(10).default(5).optional(),
-	max_anchor_associations: z.number().int().positive().max(1200).default(300).optional(),
-	max_coloc_rows_per_locus: z.number().int().positive().max(200).default(100).optional(),
-	max_eqtl_rows_per_variant: z.number().int().positive().max(500).default(200).optional(),
-	genebass_burden_sets: z.array(z.string()).default(["pLoF", "missense|LC"]).optional(),
-	include_clinvar: z.boolean().default(false).optional(),
-	include_gnomad_context: z.boolean().default(false).optional(),
-	include_hpa_tissue_context: z.boolean().default(false).optional(),
-	disable_default_seeds: z.boolean().default(false).optional(),
-};
 
 interface Anchor {
 	rsid: string;
@@ -77,73 +74,7 @@ interface Locus {
 	end: number | null;
 }
 
-interface CandidateGene {
-	locus_id: string;
-	lead_rsid: string;
-	symbol: string;
-	ensembl_id: string | null;
-}
 
-interface L2gPredictionRow {
-	locus_id: string;
-	lead_rsid: string;
-	study_locus_id: string | null;
-	symbol: string;
-	ensembl_id: string | null;
-	score: number;
-}
-
-interface ColocRow {
-	locus_id: string;
-	lead_rsid: string;
-	study_locus_id: string | null;
-	method: string | null;
-	h4: number | null;
-	clpp: number | null;
-	other_study_id: string | null;
-}
-
-interface EqtlRow {
-	lead_rsid: string;
-	symbol: string;
-	ensembl_id: string | null;
-	tissue: string;
-	p_value: number | null;
-	slope: number | null;
-}
-
-interface BurdenRow {
-	symbol: string;
-	ensembl_id: string;
-	burden_set: string;
-	phenotype: string | null;
-	p_value: number | null;
-	support: "strong" | "nominal" | "none";
-}
-
-interface ClinvarRow {
-	rsid: string;
-	variation_id: string;
-	title: string | null;
-	clinical_significance: string | null;
-	review_status: string | null;
-}
-
-interface GnomadRow {
-	symbol: string;
-	oe_lof: number | null;
-	oe_lof_upper: number | null;
-	lof_z: number | null;
-	mis_z: number | null;
-	pli: number | null;
-}
-
-interface HpaRow {
-	symbol: string;
-	ensembl_id: string | null;
-	tissues: string; // pipe-delimited
-	subcellular: string | null;
-}
 
 interface GatherBundle {
 	meta: {
@@ -155,14 +86,25 @@ interface GatherBundle {
 		caps: Record<string, unknown>;
 	};
 	tables: {
+		trait_resolution: TraitResolution[];
+		coordinate_resolution: CoordinateObservation[];
 		anchors: Anchor[];
 		loci: Locus[];
 		candidate_genes: CandidateGene[];
+		candidate_selection: CandidateSelection[];
 		l2g_predictions: L2gPredictionRow[];
+		opentargets_evidence: OpenTargetsEvidenceRow[];
 		coloc: ColocRow[];
 		eqtl: EqtlRow[];
+		gtex_evidence: GtexObservation[];
+		finngen_evidence: FinnGenObservation[];
+		finngen_phenotype_evidence: FinnGenPhenotypeObservation[];
+		eqtl_catalogue_evidence: EqtlCatalogueObservation[];
+		eqtl_catalogue_r8_evidence: EqtlR8Observation[];
 		burden: BurdenRow[];
+		genebass_evidence: GenebassObservation[];
 		clinvar: ClinvarRow[];
+		clinvar_evidence: ClinvarObservation[];
 		gnomad: GnomadRow[];
 		hpa: HpaRow[];
 	};
@@ -171,518 +113,92 @@ interface GatherBundle {
 
 const LOCUS_PADDING_BP = 1_000_000;
 
-/** Race a promise against a timeout; resolves to `null` on timeout. */
-async function withDeadline<T>(p: Promise<T>, ms: number, label: string, warnings: string[]): Promise<T | null> {
-	const timeout = new Promise<null>((resolve) =>
-		setTimeout(() => {
-			warnings.push(`${label} exceeded ${ms}ms budget — skipped`);
-			resolve(null);
-		}, ms),
-	);
-	try {
-		return await Promise.race([p, timeout]);
-	} catch (err) {
-		warnings.push(`${label} failed: ${err instanceof Error ? err.message : String(err)}`);
-		return null;
-	}
-}
-
-interface Ols4Doc {
-	iri?: string;
-	label?: string;
-	obo_id?: string;
-}
-interface Ols4Response {
-	response?: { docs?: Ols4Doc[] };
-}
-
-interface CredibleSetRow {
-	studyLocusId?: string;
-	variant?: { rsIds?: string[] };
-}
-
-function getCredibleSetRows(data: {
-	data?: { study?: { credibleSets?: { rows?: CredibleSetRow[] } } };
-}): CredibleSetRow[] {
-	const study = data?.data?.study;
-	const credibleSets = study?.credibleSets;
-	return credibleSets?.rows ?? [];
-}
-
-async function resolveEfo(
-	query: string,
-	warnings: string[],
-): Promise<{ efo_id: string | null; label: string | null }> {
-	try {
-		const data = (await ols4Search(query)) as Ols4Response;
-		const doc = data?.response?.docs?.[0];
-		if (!doc) {
-			warnings.push("OLS4: no EFO hit for trait_query");
-			return { efo_id: null, label: query };
-		}
-		return { efo_id: doc.obo_id ?? null, label: doc.label ?? query };
-	} catch (err) {
-		warnings.push(`OLS4 lookup failed: ${err instanceof Error ? err.message : String(err)}`);
-		return { efo_id: null, label: query };
-	}
-}
-
-interface GwasAssocRow {
-	rs_id?: string;
-	p_value?: number;
-	efo_traits?: Array<{ efo_trait?: string }>;
-	reported_trait?: string | string[];
-	snp_allele?: Array<{ rs_id?: string }>;
-}
-interface GwasAssocResp {
-	_embedded?: { associations?: GwasAssocRow[] };
-}
-
 async function fetchGwasAnchors(
 	efoId: string | null,
 	traitQuery: string | null,
 	size: number,
+	showChildTraits: boolean,
 	warnings: string[],
 ): Promise<Anchor[]> {
 	if (!efoId && !traitQuery) return [];
 	try {
-		const data = (await gwasAssociations({
-			efoTrait: efoId ?? undefined,
+		const data = await gwasAssociations({
+			efoId: efoId ?? undefined,
 			traitName: efoId ? undefined : traitQuery ?? undefined,
+			showChildTraits,
 			size,
-		})) as GwasAssocResp;
-		const rows = data?._embedded?.associations ?? [];
-		const seen = new Set<string>();
-		const out: Anchor[] = [];
-		for (const r of rows) {
-			const rsid = extractRsidFromAssoc(r);
-			if (!rsid || seen.has(rsid)) continue;
-			seen.add(rsid);
-			const trait = Array.isArray(r.efo_traits) && r.efo_traits[0]?.efo_trait
-				? String(r.efo_traits[0].efo_trait)
-				: Array.isArray(r.reported_trait)
-					? String(r.reported_trait[0])
-					: typeof r.reported_trait === "string"
-						? r.reported_trait
-						: null;
-			out.push({
-				rsid,
-				source: "gwas",
-				p_value: typeof r.p_value === "number" ? r.p_value : null,
-				lead_trait: trait,
-				cohort: null,
-			});
-		}
-		return out;
+		});
+		return projectGwasAnchors(data, size, warnings);
 	} catch (err) {
 		warnings.push(`GWAS Catalog anchor fetch failed: ${err instanceof Error ? err.message : String(err)}`);
 		return [];
 	}
 }
 
-function extractRsidFromAssoc(r: GwasAssocRow): string | null {
-	if (r.rs_id && /rs\d+/i.test(r.rs_id)) return r.rs_id.toLowerCase();
-	if (Array.isArray(r.snp_allele)) {
-		for (const s of r.snp_allele) {
-			const m = s.rs_id && /rs\d+/i.exec(s.rs_id);
-			if (m) return m[0].toLowerCase();
-		}
-	}
-	return null;
-}
-
-// ── OpenTargets GraphQL: batched credible-set + L2G + coloc ─────────────
-const OT_SEARCH_STUDY_QUERY = /* GraphQL */ `
-query L2GSearch($q: String!) {
-  search(queryString: $q, entityNames: ["study"], page: {index: 0, size: 20}) {
-    hits { score object { ... on Study { id projectId hasSumstats } } }
-  }
-}`;
-
-const OT_STUDY_CS_QUERY = /* GraphQL */ `
-query L2GStudy($id: String!) {
-  study(studyId: $id) {
-    credibleSets(page: {index: 0, size: 400}) {
-      rows { studyLocusId variant { id rsIds } }
-    }
-  }
-}`;
-
-const OT_BATCH_DETAIL_QUERY = /* GraphQL */ `
-query L2GBatch($ids: [String!]!) {
-  credibleSets(studyLocusIds: $ids) {
-    rows {
-      studyLocusId
-      l2GPredictions { rows { score target { id approvedSymbol } } }
-      colocalisation(page: {index: 0, size: 100}) {
-        rows { colocalisationMethod h4 clpp otherStudyLocus { studyId studyLocusId } }
-      }
-    }
-  }
-}`;
-
-interface OtStudy { id: string; projectId?: string; hasSumstats?: boolean; }
-interface OtSearchResp {
-	search?: { hits?: Array<{ score?: number; object?: OtStudy }> };
-}
-interface OtCsRow {
-	studyLocusId?: string;
-	variant?: { id?: string; rsIds?: string[] };
-}
-interface OtStudyResp { study?: { credibleSets?: { rows?: OtCsRow[] } }; }
-interface OtBatchResp {
-	credibleSets?: {
-		rows?: Array<{
-			studyLocusId?: string;
-			l2GPredictions?: { rows?: Array<{ score?: number; target?: { id?: string; approvedSymbol?: string } }> };
-			colocalisation?: { rows?: Array<{ colocalisationMethod?: string; h4?: number; clpp?: number; otherStudyLocus?: { studyId?: string } }> };
-		}>;
-	};
-}
-
-async function fetchOpenTargetsBundle(
-	anchorRsids: string[],
-	traitTerms: string[],
-	maxColocRows: number,
-	warnings: string[],
-): Promise<{ l2g: L2gPredictionRow[]; coloc: ColocRow[]; symbolsNeedingEnsembl: Map<string, string> }> {
-	const l2gRows: L2gPredictionRow[] = [];
-	const colocRows: ColocRow[] = [];
-	const symbolsNeedingEnsembl = new Map<string, string>();
-	if (anchorRsids.length === 0 || traitTerms.length === 0) return { l2g: l2gRows, coloc: colocRows, symbolsNeedingEnsembl };
-
-	// Step 1: search studies for each trait term in parallel (batched)
-	const studyResults = await Promise.all(
-		traitTerms.map((t) =>
-			opentargetsGraphql<OtSearchResp>(OT_SEARCH_STUDY_QUERY, { q: t }).catch((err) => {
-				warnings.push(`OpenTargets search failed for "${t}": ${err instanceof Error ? err.message : String(err)}`);
-				return { data: undefined } as const;
-			}),
-		),
-	);
-
-	const studies = new Map<string, OtStudy>();
-	for (const sr of studyResults) {
-		const hits = sr?.data?.search?.hits ?? [];
-		for (const hit of hits) {
-			const obj = hit?.object;
-			if (obj?.id) studies.set(obj.id, obj);
-		}
-	}
-	const preferredStudies = [...studies.values()].filter((s) => s.hasSumstats).slice(0, 6);
-	const chosen = preferredStudies.length > 0 ? preferredStudies : [...studies.values()].slice(0, 6);
-
-	// Step 2: for each study, fetch credible sets (in parallel)
-	const anchorSet = new Set(anchorRsids.map((r) => r.toLowerCase()));
-	const studyLocusAnchorMap = new Map<string, Set<string>>();
-
-	const csResults = await Promise.all(
-		chosen.map((s) =>
-			opentargetsGraphql<OtStudyResp>(OT_STUDY_CS_QUERY, { id: s.id }).catch((err) => {
-				warnings.push(`OpenTargets study ${s.id} CS fetch failed: ${err instanceof Error ? err.message : String(err)}`);
-				return { data: undefined } as const;
-			}),
-		),
-	);
-	for (const cs of csResults) {
-		const rows = getCredibleSetRows(cs);
-		for (const row of rows) {
-			if (!row.studyLocusId) continue;
-			const rsids = (row.variant?.rsIds ?? []).map((r) => r.toLowerCase());
-			const matched = rsids.filter((r) => anchorSet.has(r));
-			if (matched.length > 0) {
-				const existing = studyLocusAnchorMap.get(row.studyLocusId) ?? new Set<string>();
-				for (const m of matched) existing.add(m);
-				studyLocusAnchorMap.set(row.studyLocusId, existing);
-			}
-		}
-	}
-
-	// Step 3: batched detail fetch (chunks of 40)
-	const studyLocusIds = [...studyLocusAnchorMap.keys()];
-	const chunks: string[][] = [];
-	for (let i = 0; i < studyLocusIds.length; i += 40) chunks.push(studyLocusIds.slice(i, i + 40));
-	const detailResults = await Promise.all(
-		chunks.map((chunk) =>
-			opentargetsGraphql<OtBatchResp>(OT_BATCH_DETAIL_QUERY, { ids: chunk }).catch((err) => {
-				warnings.push(`OpenTargets batch detail failed: ${err instanceof Error ? err.message : String(err)}`);
-				return { data: undefined } as const;
-			}),
-		),
-	);
-	for (const dr of detailResults) {
-		const rows = dr?.data?.credibleSets?.rows ?? [];
-		for (const row of rows) {
-			const slId = row.studyLocusId;
-			if (!slId) continue;
-			const anchors = studyLocusAnchorMap.get(slId) ?? new Set<string>();
-			if (anchors.size === 0) continue;
-
-			const l2gList = row.l2GPredictions?.rows ?? [];
-			const colocList = (row.colocalisation?.rows ?? []).slice(0, maxColocRows);
-
-			for (const anchor of anchors) {
-				for (const pred of l2gList) {
-					const symbol = pred.target?.approvedSymbol;
-					if (!symbol) continue;
-					const ensembl = pred.target?.id ?? null;
-					if (symbol && ensembl) symbolsNeedingEnsembl.set(symbol, ensembl);
-					l2gRows.push({
-						locus_id: `rsid:${anchor}`, // placeholder — enriched with coords later
-						lead_rsid: anchor,
-						study_locus_id: slId,
-						symbol,
-						ensembl_id: ensembl,
-						score: Number(pred.score ?? 0),
-					});
-				}
-				for (const coloc of colocList) {
-					colocRows.push({
-						locus_id: `rsid:${anchor}`,
-						lead_rsid: anchor,
-						study_locus_id: slId,
-						method: coloc.colocalisationMethod ?? null,
-						h4: typeof coloc.h4 === "number" ? coloc.h4 : null,
-						clpp: typeof coloc.clpp === "number" ? coloc.clpp : null,
-						other_study_id: coloc.otherStudyLocus?.studyId ?? null,
-					});
-				}
-			}
-		}
-	}
-
-	return { l2g: l2gRows, coloc: colocRows, symbolsNeedingEnsembl };
-}
-
-// ── GTEx: batched eQTLs for the anchor variantIds ───────────────────────
-interface GtexSingleTissueEqtl {
-	variantId?: string;
-	snpId?: string;
-	geneSymbol?: string;
-	gencodeId?: string;
-	tissueSiteDetailId?: string;
-	pValue?: number;
-	nes?: number;
-}
-interface GtexEqtlResp { data?: GtexSingleTissueEqtl[]; }
-
-async function fetchGtexEqtls(
-	anchors: Anchor[],
-	maxRowsPerVariant: number,
-	warnings: string[],
-): Promise<EqtlRow[]> {
-	const variantIds: string[] = [];
-	const vidToRsid = new Map<string, string>();
-	for (const a of anchors) {
-		const g38 = a.grch38;
-		if (!g38?.chr || !g38.pos || !g38.ref || !g38.alt) continue;
-		const vid = `chr${g38.chr}_${g38.pos}_${g38.ref}_${g38.alt}_b38`;
-		variantIds.push(vid);
-		vidToRsid.set(vid, a.rsid);
-	}
-	if (variantIds.length === 0) return [];
-
-	// GTEx accepts multiple variantId values as repeated query params; cap per-batch
-	try {
-		const resp = (await gtexEqtlsByVariants(variantIds, { itemsPerPage: Math.min(250, maxRowsPerVariant * variantIds.length) })) as GtexEqtlResp;
-		const rows = resp?.data ?? [];
-		const out: EqtlRow[] = [];
-		for (const r of rows) {
-			const vid = r.variantId ?? "";
-			const rsid = vidToRsid.get(vid) ?? (r.snpId ?? "").toLowerCase();
-			if (!rsid || !r.geneSymbol) continue;
-			out.push({
-				lead_rsid: rsid,
-				symbol: r.geneSymbol,
-				ensembl_id: r.gencodeId ? r.gencodeId.split(".")[0] : null,
-				tissue: r.tissueSiteDetailId ?? ".",
-				p_value: typeof r.pValue === "number" ? r.pValue : null,
-				slope: typeof r.nes === "number" ? r.nes : null,
-			});
-		}
-		return out;
-	} catch (err) {
-		warnings.push(`GTEx eQTL batch failed: ${err instanceof Error ? err.message : String(err)}`);
-		return [];
-	}
-}
-
 // ── Optional lanes ──────────────────────────────────────────────────────
-async function fetchClinvarLane(rsids: string[], warnings: string[]): Promise<ClinvarRow[]> {
-	const out: ClinvarRow[] = [];
-	// Step 1: esearch each rsid (in parallel; capped)
-	const searches = await Promise.all(
-		rsids.slice(0, 30).map(async (rsid) => {
-			try {
-				const res = (await clinvarEsearchByRsid(rsid)) as { esearchresult?: { idlist?: string[] } };
-				const ids = res?.esearchresult?.idlist ?? [];
-				return { rsid, ids: ids.slice(0, 3) };
-			} catch (err) {
-				warnings.push(`ClinVar esearch failed for ${rsid}: ${err instanceof Error ? err.message : String(err)}`);
-				return { rsid, ids: [] as string[] };
-			}
-		}),
-	);
-	const idToRsid = new Map<string, string>();
-	const allIds: string[] = [];
-	for (const s of searches) {
-		for (const id of s.ids) {
-			idToRsid.set(id, s.rsid);
-			allIds.push(id);
-		}
-	}
-	if (allIds.length === 0) return out;
-	// Step 2: esummary in one batch
-	try {
-		const sum = (await clinvarEsummary(allIds)) as {
-			result?: Record<string, { title?: string; clinical_significance?: { description?: string }; review_status?: string }>;
-		};
-		const records = sum?.result ?? {};
-		for (const [id, rec] of Object.entries(records)) {
-			if (id === "uids") continue;
-			const rsid = idToRsid.get(id);
-			if (!rsid) continue;
-			out.push({
-				rsid,
-				variation_id: id,
-				title: rec?.title ?? null,
-				clinical_significance: rec?.clinical_significance?.description ?? null,
-				review_status: rec?.review_status ?? null,
-			});
-		}
-	} catch (err) {
-		warnings.push(`ClinVar esummary failed: ${err instanceof Error ? err.message : String(err)}`);
-	}
-	return out;
-}
-
-const GNOMAD_GENE_QUERY = /* GraphQL */ `
-query L2GGene($symbol: String!, $ref: ReferenceGenomeId!) {
-  gene(gene_symbol: $symbol, reference_genome: $ref) {
-    symbol
-    gnomad_constraint { oe_lof oe_lof_upper lof_z mis_z pLI }
-  }
-}`;
-interface GnomadGeneResp { gene?: { symbol?: string; gnomad_constraint?: { oe_lof?: number; oe_lof_upper?: number; lof_z?: number; mis_z?: number; pLI?: number } }; }
-
-async function fetchGnomadLane(symbols: string[], warnings: string[]): Promise<GnomadRow[]> {
-	const out: GnomadRow[] = [];
-	const capped = symbols.slice(0, 40);
-	const results = await Promise.all(
-		capped.map((symbol) =>
-			gnomadGraphql<GnomadGeneResp>(GNOMAD_GENE_QUERY, { symbol, ref: "GRCh38" }).catch((err) => {
-				warnings.push(`gnomAD failed for ${symbol}: ${err instanceof Error ? err.message : String(err)}`);
-				return { data: undefined } as const;
-			}),
-		),
-	);
-	for (const r of results) {
-		const g = r?.data?.gene;
-		const c = g?.gnomad_constraint;
-		if (!g?.symbol) continue;
-		out.push({
-			symbol: g.symbol,
-			oe_lof: c?.oe_lof ?? null,
-			oe_lof_upper: c?.oe_lof_upper ?? null,
-			lof_z: c?.lof_z ?? null,
-			mis_z: c?.mis_z ?? null,
-			pli: c?.pLI ?? null,
-		});
-	}
-	return out;
-}
-
-interface HpaGeneRecord {
-	Gene?: string;
-	Ensembl?: string;
-	"Tissue expression - nTPM"?: Record<string, number>;
-	"Subcellular location"?: string;
-}
-
-async function fetchHpaLane(
-	symbolToEnsembl: Map<string, string>,
-	warnings: string[],
-): Promise<HpaRow[]> {
-	const out: HpaRow[] = [];
-	const entries = [...symbolToEnsembl.entries()].slice(0, 20);
-	const results = await Promise.all(
-		entries.map(async ([symbol, ensembl]) => {
-			try {
-				const data = (await hpaGene(ensembl)) as HpaGeneRecord;
-				const tissues = data?.["Tissue expression - nTPM"];
-				const tissueList = tissues && typeof tissues === "object"
-					? Object.entries(tissues)
-						.filter(([, v]) => typeof v === "number" && v >= 1)
-						.sort((a, b) => Number(b[1]) - Number(a[1]))
-						.slice(0, 8)
-						.map(([k]) => k)
-					: [];
-				return {
-					symbol,
-					ensembl_id: ensembl,
-					tissues: tissueList.join(" | "),
-					subcellular: data?.["Subcellular location"] ?? null,
-				} satisfies HpaRow;
-			} catch (err) {
-				warnings.push(`HPA failed for ${symbol}: ${err instanceof Error ? err.message : String(err)}`);
-				return null;
-			}
-		}),
-	);
-	for (const r of results) if (r) out.push(r);
-	return out;
-}
 
 // ── Genebass burden (stage 4) ───────────────────────────────────────────
-interface GenebassResp { associations?: Array<{ phenotype_description?: string; skat_o_pvalue?: number }>; }
-
-async function fetchGenebassLane(
-	symbolToEnsembl: Map<string, string>,
-	burdenSets: string[],
-	warnings: string[],
-): Promise<BurdenRow[]> {
-	const out: BurdenRow[] = [];
-	const entries = [...symbolToEnsembl.entries()].slice(0, 25); // hard cap for subrequest budget
-	const jobs: Promise<void>[] = [];
-	for (const [symbol, ensembl] of entries) {
-		for (const burdenSet of burdenSets) {
-			jobs.push(
-				(async () => {
-					try {
-						const data = (await genebassGeneBurden(ensembl, burdenSet)) as GenebassResp;
-						const assocs = data?.associations ?? [];
-						let best_p: number | null = null;
-						let best_phenotype: string | null = null;
-						for (const row of assocs) {
-							if (typeof row.skat_o_pvalue !== "number") continue;
-							if (best_p == null || row.skat_o_pvalue < best_p) {
-								best_p = row.skat_o_pvalue;
-								best_phenotype = row.phenotype_description ?? null;
-							}
-						}
-						let support: BurdenRow["support"] = "none";
-						if (best_p != null && best_p < 2.5e-6) support = "strong";
-						else if (best_p != null && best_p < 0.05) support = "nominal";
-						out.push({
-							symbol,
-							ensembl_id: ensembl,
-							burden_set: burdenSet,
-							phenotype: best_phenotype,
-							p_value: best_p,
-							support,
-						});
-					} catch (err) {
-						warnings.push(`Genebass failed for ${symbol}/${burdenSet}: ${err instanceof Error ? err.message : String(err)}`);
-					}
-				})(),
-			);
-		}
-	}
-	await Promise.all(jobs);
-	return out;
-}
-
 // ── Main tool ───────────────────────────────────────────────────────────
+
+function createGatherBundle(parsed: ReturnType<typeof gatherInputs>, projected: number): GatherBundle {
+	return {
+		meta: {
+			trait_query: parsed.trait_query,
+			efo_id: parsed.efo_id,
+			efo_label: null,
+			generated_at: new Date().toISOString(),
+			sources_queried: [],
+			caps: {
+				max_loci: parsed.max_loci,
+				max_genes_per_locus: parsed.max_genes_per_locus,
+				max_anchor_associations: parsed.max_anchor_associations,
+				show_child_traits: parsed.show_child_traits,
+				max_coloc_rows_per_locus: parsed.max_coloc_rows_per_locus,
+				max_eqtl_rows_per_variant: parsed.max_eqtl_rows_per_variant,
+				gtex_dataset_id: parsed.gtex_dataset_id,
+				finngen_release: parsed.finngen_release ?? null,
+				finngen_phenocode: parsed.finngen_phenocode ?? null,
+				finngen_join_version: FINNGEN_JOIN_VERSION,
+				eqtl_catalogue: parsed.eqtl_catalogue ?? null,
+				eqtl_catalogue_context_version: EQTL_CATALOGUE_CONTEXT_VERSION,
+				eqtl_catalogue_r8: parsed.eqtl_catalogue_r8 ?? null,
+				eqtl_catalogue_r8_context_version: EQTL_R8_CONTEXT_VERSION,
+				include_clinvar: parsed.include_clinvar,
+				clinvar_context_version: CLINVAR_CONTEXT_VERSION,
+				include_gnomad_context: parsed.include_gnomad_context,
+				gnomad_context_version: GNOMAD_CONTEXT_VERSION,
+				include_hpa_tissue_context: parsed.include_hpa_tissue_context,
+				hpa_context_version: HPA_CONTEXT_VERSION,
+				genebass_context_version: GENEBASS_CONTEXT_VERSION,
+				projected_subrequests: projected,
+			},
+		},
+		tables: {
+			trait_resolution: [],
+			coordinate_resolution: [],
+			anchors: [],
+			loci: [],
+			candidate_genes: [],
+			candidate_selection: [],
+			l2g_predictions: [],
+			opentargets_evidence: [],
+			coloc: [],
+			eqtl: [],
+			gtex_evidence: [],
+			finngen_evidence: [],
+			finngen_phenotype_evidence: [],
+			eqtl_catalogue_evidence: [],
+			eqtl_catalogue_r8_evidence: [],
+			burden: [],
+			genebass_evidence: [],
+			clinvar: [],
+			clinvar_evidence: [],
+			gnomad: [],
+			hpa: [],
+		},
+		warnings: [],
+	};
+}
 
 export function registerL2gGather(server: McpServer, env?: GatherEnv): void {
 	const handler = async (args: Record<string, unknown>, extra: unknown) => {
@@ -691,24 +207,10 @@ export function registerL2gGather(server: McpServer, env?: GatherEnv): void {
 		const startedAt = Date.now();
 
 		try {
-			const parsed = {
-				trait_query: (args.trait_query as string | undefined) ?? null,
-				efo_id: (args.efo_id as string | undefined) ?? null,
-				seed_rsids: (args.seed_rsids as string[] | undefined) ?? [],
-				target_gene: (args.target_gene as string | undefined) ?? null,
-				max_loci: Number(args.max_loci ?? 8),
-				max_genes_per_locus: Number(args.max_genes_per_locus ?? 5),
-				max_anchor_associations: Number(args.max_anchor_associations ?? 300),
-				max_coloc_rows_per_locus: Number(args.max_coloc_rows_per_locus ?? 100),
-				max_eqtl_rows_per_variant: Number(args.max_eqtl_rows_per_variant ?? 200),
-				genebass_burden_sets: (args.genebass_burden_sets as string[] | undefined) ?? ["pLoF", "missense|LC"],
-				include_clinvar: Boolean(args.include_clinvar ?? false),
-				include_gnomad_context: Boolean(args.include_gnomad_context ?? false),
-				include_hpa_tissue_context: Boolean(args.include_hpa_tissue_context ?? false),
-				disable_default_seeds: Boolean(args.disable_default_seeds ?? false),
-			};
+			const parsed = gatherInputs(args);
 
 			// Validate input
+			if (parsed.efo_id !== null && !traitId(parsed.efo_id)) return createCodeModeError("INVALID_ARGUMENTS", "efo_id must be an ontology ID such as EFO_0001360 or EFO:0001360.");
 			let seedRsids = parsed.seed_rsids.slice();
 			const hasAnyAnchor = parsed.trait_query || parsed.efo_id || seedRsids.length > 0;
 			if (!hasAnyAnchor) {
@@ -726,38 +228,7 @@ export function registerL2gGather(server: McpServer, env?: GatherEnv): void {
 				}
 			}
 
-			// Project subrequest budget up front.
-			// Upper bounds reflect the worst-case fan-out per stage assuming every
-			// anchor survives normalization and every candidate gene is queried.
-			// The previous formula under-counted by ~4-5× because it used
-			// max_loci as the anchor ceiling instead of max_anchor_associations,
-			// and ignored per-candidate gnomAD/HPA fan-out.
-			const anchorCeiling = Math.min(
-				parsed.max_anchor_associations,
-				Math.max(seedRsids.length, parsed.max_loci * 4),
-			);
-			const candidateGenesCeiling = parsed.max_loci * parsed.max_genes_per_locus;
-			const coordBudget = anchorCeiling * 2;
-			const otBudget =
-				15 + Math.ceil(anchorCeiling / 40) * 3 + Math.ceil(parsed.max_loci / 5);
-			const gtexBudget = Math.max(1, Math.ceil(anchorCeiling / 40));
-			// ClinVar: esummary is batched ~20 ids per request
-			const clinvarBudget = parsed.include_clinvar
-				? Math.ceil(anchorCeiling / 20) + 1
-				: 0;
-			// gnomAD / HPA fan out per candidate gene
-			const gnomadBudget = parsed.include_gnomad_context ? candidateGenesCeiling : 0;
-			const hpaBudget = parsed.include_hpa_tissue_context ? candidateGenesCeiling : 0;
-			const genebassBudget = candidateGenesCeiling * parsed.genebass_burden_sets.length;
-			const projected =
-				2 +
-				coordBudget +
-				otBudget +
-				gtexBudget +
-				clinvarBudget +
-				gnomadBudget +
-				hpaBudget +
-				genebassBudget;
+			const projected = projectedSubrequests(parsed, seedRsids.length);
 			if (projected > 800) {
 				return createCodeModeError(
 					"INVALID_ARGUMENTS",
@@ -765,54 +236,18 @@ export function registerL2gGather(server: McpServer, env?: GatherEnv): void {
 				);
 			}
 
-			const bundle: GatherBundle = {
-				meta: {
-					trait_query: parsed.trait_query,
-					efo_id: parsed.efo_id,
-					efo_label: null,
-					generated_at: new Date().toISOString(),
-					sources_queried: [],
-					caps: {
-						max_loci: parsed.max_loci,
-						max_genes_per_locus: parsed.max_genes_per_locus,
-						max_anchor_associations: parsed.max_anchor_associations,
-						max_coloc_rows_per_locus: parsed.max_coloc_rows_per_locus,
-						max_eqtl_rows_per_variant: parsed.max_eqtl_rows_per_variant,
-						include_clinvar: parsed.include_clinvar,
-						include_gnomad_context: parsed.include_gnomad_context,
-						include_hpa_tissue_context: parsed.include_hpa_tissue_context,
-						projected_subrequests: projected,
-					},
-				},
-				tables: {
-					anchors: [],
-					loci: [],
-					candidate_genes: [],
-					l2g_predictions: [],
-					coloc: [],
-					eqtl: [],
-					burden: [],
-					clinvar: [],
-					gnomad: [],
-					hpa: [],
-				},
-				warnings: [],
-			};
+			const bundle = createGatherBundle(parsed, projected);
 
 			// ── Stage 1: EFO resolve + GWAS anchor fetch ──
-			let efoLabel: string | null = null;
-			let efoId = parsed.efo_id;
-			if (parsed.trait_query && !efoId) {
-				const efo = await resolveEfo(parsed.trait_query, warnings);
-				efoId = efo.efo_id;
-				efoLabel = efo.label;
-				bundle.meta.sources_queried.push("ols4");
-			}
+			const resolution = await resolveTrait(parsed.trait_query, parsed.efo_id, warnings);
+			const { efo_id: efoId, label: efoLabel } = resolution;
+			bundle.tables.trait_resolution = [resolution];
+			if (parsed.trait_query && !parsed.efo_id) bundle.meta.sources_queried.push("ols4");
 			bundle.meta.efo_id = efoId;
 			bundle.meta.efo_label = efoLabel;
 
 			const gwasAnchors = parsed.max_anchor_associations > 0
-				? await fetchGwasAnchors(efoId, parsed.trait_query, Math.min(parsed.max_anchor_associations, 300), warnings)
+				? await fetchGwasAnchors(efoId, parsed.trait_query, Math.min(parsed.max_anchor_associations, 300), parsed.show_child_traits, warnings)
 				: [];
 			if (gwasAnchors.length > 0) bundle.meta.sources_queried.push("gwas_catalog");
 
@@ -839,27 +274,16 @@ export function registerL2gGather(server: McpServer, env?: GatherEnv): void {
 
 			if (anchorsList.length === 0) {
 				warnings.push("No anchors after normalization; nothing to gather.");
-				bundle.warnings = warnings;
 				return createCodeModeError(
 					"NOT_FOUND",
 					"No anchors remained after normalization. Provide seed_rsids or try a different trait_query.",
+					{ trait_resolution: resolution, warnings },
 				);
 			}
 
 			// ── Stage 2: Coordinate normalization (parallel, 7s deadline) ──
 			bundle.meta.sources_queried.push("ensembl");
-			const coordPromise = Promise.all(
-				anchorsList.map(async (a) => {
-					try {
-						const resolved = await resolveRsid(a.rsid);
-						a.grch38 = resolved.grch38;
-						a.grch37 = resolved.grch37;
-					} catch (err) {
-						warnings.push(`Ensembl rsid lookup failed for ${a.rsid}: ${err instanceof Error ? err.message : String(err)}`);
-					}
-				}),
-			);
-			await withDeadline(coordPromise, 7000, "coordinate normalization", warnings);
+			bundle.tables.coordinate_resolution = await gatherCoordinates(anchorsList, warnings);
 
 			// Build loci rows
 			for (const a of anchorsList) {
@@ -890,94 +314,75 @@ export function registerL2gGather(server: McpServer, env?: GatherEnv): void {
 
 			const rsids = anchorsList.map((a) => a.rsid);
 
-			const otPromise = fetchOpenTargetsBundle(rsids, traitTerms, parsed.max_coloc_rows_per_locus, warnings);
-			const gtexPromise = fetchGtexEqtls(anchorsList, parsed.max_eqtl_rows_per_variant, warnings);
+			const otPromise = fetchOpenTargetsBundle(anchorsList, traitTerms, parsed.max_coloc_rows_per_locus, warnings, efoId);
+			const gtexPromise = fetchGtexEqtls(anchorsList, parsed.max_eqtl_rows_per_variant, warnings, parsed.gtex_dataset_id);
+			const eqtlCataloguePromise = fetchEqtlCatalogueContext(anchorsList, parsed.eqtl_catalogue, warnings);
+			const eqtlR8Promise = fetchEqtlR8Context(anchorsList, parsed.eqtl_catalogue_r8, warnings, runtimeEnv);
+			const finngenPromise = parsed.finngen_release ? fetchFinnGenContext(anchorsList, parsed.finngen_release, warnings) : Promise.resolve([]);
+			const phenotypePromise = parsed.finngen_release && parsed.finngen_phenocode ? fetchFinnGenPhenotype(parsed.finngen_release, parsed.finngen_phenocode) : Promise.resolve([]);
 			const clinvarPromise = parsed.include_clinvar
 				? fetchClinvarLane(rsids, warnings)
-				: Promise.resolve([] as ClinvarRow[]);
+				: Promise.resolve({ rows: [] as ClinvarRow[], evidence: [] as ClinvarObservation[] });
 
 			const stage3 = await withDeadline(
-				Promise.all([otPromise, gtexPromise, clinvarPromise]),
+				Promise.all([otPromise, gtexPromise]),
 				15_000,
 				"stage-3 fan-out",
 				warnings,
 			);
 
+			bundle.tables.eqtl_catalogue_evidence = await eqtlCataloguePromise;
+			bundle.tables.eqtl_catalogue_r8_evidence = await eqtlR8Promise;
+			if (bundle.tables.eqtl_catalogue_r8_evidence.some(row => row.source_url)) bundle.meta.sources_queried.push("eqtl_catalogue_r8");
+			if (bundle.tables.eqtl_catalogue_evidence.some(row => row.source_url)) bundle.meta.sources_queried.push("eqtl_catalogue");
+			bundle.tables.finngen_evidence = await finngenPromise;
+			bundle.tables.finngen_phenotype_evidence = await phenotypePromise;
+			for (const row of bundle.tables.finngen_phenotype_evidence) if (row.error) warnings.push(`FinnGen phenotype ${row.requested_phenocode}: ${row.error}`);
+			if (bundle.tables.finngen_evidence.some(row => row.source_url) || bundle.tables.finngen_phenotype_evidence.length) bundle.meta.sources_queried.push("finngen");
+			const cvRes = await clinvarPromise;
+			bundle.tables.clinvar = cvRes.rows;
+			bundle.tables.clinvar_evidence = cvRes.evidence;
+			if (cvRes.evidence.some(row => row.source_url)) bundle.meta.sources_queried.push("clinvar");
 			const symbolToEnsembl = new Map<string, string>();
 			if (stage3) {
-				const [otRes, gtexRes, cvRes] = stage3;
-				if (otRes) {
-					// Patch locus_id onto l2g/coloc rows from anchor rsids
-					for (const row of otRes.l2g) {
-						const a = anchorsList.find((x) => x.rsid === row.lead_rsid);
-						row.locus_id = a?.locus_id ?? row.locus_id;
-						if (row.symbol && row.ensembl_id) symbolToEnsembl.set(row.symbol, row.ensembl_id);
-					}
-					for (const row of otRes.coloc) {
-						const a = anchorsList.find((x) => x.rsid === row.lead_rsid);
-						row.locus_id = a?.locus_id ?? row.locus_id;
-					}
-					bundle.tables.l2g_predictions = otRes.l2g;
-					bundle.tables.coloc = otRes.coloc;
-					for (const [sym, id] of otRes.symbolsNeedingEnsembl) symbolToEnsembl.set(sym, id);
-				}
+				const [otRes, gtexRes] = stage3;
+				if (otRes) applyOpenTargetsBundle(otRes, anchorsList, bundle.tables, symbolToEnsembl);
 				if (gtexRes) {
-					bundle.tables.eqtl = gtexRes;
-					for (const r of gtexRes) if (r.ensembl_id) symbolToEnsembl.set(r.symbol, r.ensembl_id);
-				}
-				if (cvRes) {
-					bundle.tables.clinvar = cvRes;
-					if (parsed.include_clinvar) bundle.meta.sources_queried.push("clinvar");
+					bundle.tables.eqtl = gtexRes.rows;
+					bundle.tables.gtex_evidence = gtexRes.evidence;
+					for (const r of gtexRes.rows) if (r.ensembl_id) symbolToEnsembl.set(r.symbol, r.ensembl_id);
 				}
 			}
 
-			// Build candidate_genes from l2g predictions (per locus, up to max_genes_per_locus)
-			const perLocusGenes = new Map<string, Map<string, string | null>>();
-			for (const row of bundle.tables.l2g_predictions) {
-				const locus = row.locus_id;
-				if (!perLocusGenes.has(locus)) perLocusGenes.set(locus, new Map());
-				const m = perLocusGenes.get(locus);
-				if (m && !m.has(row.symbol)) m.set(row.symbol, row.ensembl_id ?? null);
-			}
-			for (const [locus_id, genes] of perLocusGenes) {
-				const anchor = anchorsList.find((a) => a.locus_id === locus_id);
-				let count = 0;
-				for (const [symbol, ensembl_id] of genes) {
-					if (count >= parsed.max_genes_per_locus) break;
-					bundle.tables.candidate_genes.push({
-						locus_id,
-						lead_rsid: anchor?.rsid ?? "",
-						symbol,
-						ensembl_id,
-					});
-					count++;
-				}
-			}
+			const selected = selectCandidateGenes(bundle.tables.l2g_predictions, anchorsList, parsed.max_genes_per_locus, warnings);
+			bundle.tables.candidate_genes = selected.candidates;
+			bundle.tables.candidate_selection = selected.selection;
 
 			// ── Stage 4: gnomAD + HPA + Genebass (all parallel, 12s deadline) ──
-			const symbols = [...symbolToEnsembl.keys()];
 			const gnomadPromise = parsed.include_gnomad_context
-				? fetchGnomadLane(symbols, warnings)
+				? fetchGnomadLane(bundle.tables.candidate_genes, warnings)
 				: Promise.resolve([] as GnomadRow[]);
 			const hpaPromise = parsed.include_hpa_tissue_context
 				? fetchHpaLane(symbolToEnsembl, warnings)
 				: Promise.resolve([] as HpaRow[]);
-			const genebassPromise = fetchGenebassLane(symbolToEnsembl, parsed.genebass_burden_sets, warnings);
+			const genebassPromise = fetchGenebassContext(symbolToEnsembl, parsed.genebass_burden_sets, warnings);
 
 			const stage4 = await withDeadline(
-				Promise.all([gnomadPromise, hpaPromise, genebassPromise]),
+				Promise.all([gnomadPromise, hpaPromise, genebassPromise, fetchBurdenEvidence(selected.candidates, efoId, warnings)]),
 				12_000,
 				"stage-4 fan-out",
 				warnings,
 			);
 			if (stage4) {
-				const [gnomadRes, hpaRes, burdenRes] = stage4;
+				const [gnomadRes, hpaRes, burdenRes, burdenEvidence] = stage4;
+				bundle.tables.opentargets_evidence.push(...burdenEvidence);
 				bundle.tables.gnomad = gnomadRes ?? [];
 				if (parsed.include_gnomad_context && (gnomadRes?.length ?? 0) > 0) bundle.meta.sources_queried.push("gnomad");
 				bundle.tables.hpa = hpaRes ?? [];
-				if (parsed.include_hpa_tissue_context && (hpaRes?.length ?? 0) > 0) bundle.meta.sources_queried.push("hpa");
-				bundle.tables.burden = burdenRes ?? [];
-				if ((burdenRes?.length ?? 0) > 0) bundle.meta.sources_queried.push("genebass");
+				if (parsed.include_hpa_tissue_context && hpaRes?.some(row => row.source_url)) bundle.meta.sources_queried.push("hpa");
+				bundle.tables.burden = burdenRes.rows;
+				bundle.tables.genebass_evidence = burdenRes.evidence;
+				if (burdenRes.evidence.length > 0) bundle.meta.sources_queried.push("genebass");
 			}
 
 			bundle.warnings = warnings;
@@ -989,68 +394,10 @@ export function registerL2gGather(server: McpServer, env?: GatherEnv): void {
 					"L2G_DATA_DO namespace unavailable — cannot stage gather results.",
 				);
 			}
-			const staged = await stageToDoAndRespond(
-				bundle.tables,
-				runtimeEnv.L2G_DATA_DO,
-				"l2g",
-				undefined,
-				{ toolName: "l2g_gather", serverName: "l2g-mapper-mcp-server" },
-				"l2g",
-				(extra as Record<string, unknown>),
-			);
-
-			// Also persist meta + warnings as a small side-table via second /process call.
-			try {
-				const metaDoId = runtimeEnv.L2G_DATA_DO.idFromName(staged.dataAccessId);
-				const metaDo = runtimeEnv.L2G_DATA_DO.get(metaDoId);
-				await metaDo.fetch(
-					new Request("http://do.internal/process", {
-						method: "POST",
-						headers: { "Content-Type": "application/json" },
-						body: JSON.stringify({
-							data: {
-								l2g_meta: [
-									{
-										trait_query: bundle.meta.trait_query,
-										efo_id: bundle.meta.efo_id,
-										efo_label: bundle.meta.efo_label,
-										generated_at: bundle.meta.generated_at,
-										sources_queried: (bundle.meta.sources_queried ?? []).join(" | "),
-										target_gene: parsed.target_gene,
-										caps_json: JSON.stringify(bundle.meta.caps),
-										warnings_json: JSON.stringify(bundle.warnings),
-									},
-								],
-							},
-						}),
-					}),
-				);
-			} catch (err) {
-				warnings.push(`Meta side-table write failed: ${err instanceof Error ? err.message : String(err)}`);
-			}
-
-			const elapsed_ms = Date.now() - startedAt;
-			return createCodeModeResponse(
-				{
-					data_access_id: staged.dataAccessId,
-					trait: {
-						query: bundle.meta.trait_query,
-						efo_id: bundle.meta.efo_id,
-						label: bundle.meta.efo_label,
-					},
-					anchors_count: bundle.tables.anchors.length,
-					loci_count: bundle.tables.loci.length,
-					candidate_genes_count: bundle.tables.candidate_genes.length,
-					elapsed_ms,
-					warnings,
-					_staging: staged._staging,
-					next_step: `Call l2g_score with data_access_id='${staged.dataAccessId}'.`,
-				},
-				{
-					textSummary: `l2g_gather staged ${bundle.tables.anchors.length} anchors / ${bundle.tables.loci.length} loci in ${elapsed_ms}ms. data_access_id=${staged.dataAccessId}`,
-					meta: { data_access_id: staged.dataAccessId, elapsed_ms },
-				},
-			);
+			return await stageGatherResult({
+				tables: bundle.tables, meta: { ...bundle.meta, target_gene: parsed.target_gene },
+				warnings, args, elapsedMs: Date.now() - startedAt, namespace: runtimeEnv.L2G_DATA_DO, extra,
+			});
 		} catch (err) {
 			const msg = err instanceof Error ? err.message : String(err);
 			return createCodeModeError("API_ERROR", `l2g_gather failed: ${msg}`);
@@ -1063,14 +410,13 @@ export function registerL2gGather(server: McpServer, env?: GatherEnv): void {
 			{
 				title: "L2G Gather Evidence",
 				description:
-					"Stage 1 of the locus-to-gene composer. Resolves a trait, collects GWAS anchors, " +
-					"normalizes variant coordinates, and fans out in parallel to OpenTargets (L2G+coloc), " +
-					"GTEx eQTL, Genebass burden, and optional ClinVar/gnomAD/HPA lanes. Stages all results " +
-					"into a DO keyed by data_access_id. Reduced synchronous caps: max_loci=8, " +
-					"max_anchor_associations=300, optional lanes off by default. Fits in the 30s Worker budget.",
+                    "Gather bounded locus-to-gene evidence from Open Targets, GTEx, GWAS Catalog, Genebass and optional context lanes. " +
+                    "Stages native Open Targets responses, observed releases, study/model features and incomplete-page warnings. " +
+                    "Missing or mixed release evidence cannot feed ranking. Model artifact versions remain unknown. " +
+                    "Inspect trait_resolution, opentargets_evidence and l2g_meta using l2g_query_data before l2g_score. Optional finngen_release adds native GRCh38 variant context in finngen_evidence without changing gene scores. Optional eqtl_catalogue selects one pinned r7 dataset/anchor; nominal rows alone do not score. Add fine_mapping_sha256 to qualify exact-gene/allele credible-set support with native PIP >= 0.95. Ambiguous labels require explicit efo_id. Default max_loci=8; optional lanes off.",
 				inputSchema,
 			},
-			(args, extra) => handler(args as Record<string, unknown>, extra),
+			(args, extra) => l2gResponse(() => handler(args as Record<string, unknown>, extra), env || (extra as { env?: GatherEnv })?.env || {}, name, args, extra),
 		);
 
 	reg("mcp_l2g_gather");

@@ -47,9 +47,9 @@ assert("src/index.ts", indexSrc, "registerL2gSynthesize", "index.ts wires l2g_sy
 const gather = read("src/tools/l2g-gather.ts");
 assert("src/tools/l2g-gather.ts", gather, "mcp_l2g_gather", "l2g_gather dual-registered under mcp_l2g_gather");
 assert("src/tools/l2g-gather.ts", gather, 'reg("l2g_gather")', "l2g_gather dual-registered under l2g_gather");
-assert("src/tools/l2g-gather.ts", gather, "createCodeModeResponse", "l2g_gather returns structuredContent");
+assert("src/lib/gather-result.ts", read("src/lib/gather-result.ts"), "createCodeModeResponse", "l2g_gather returns structuredContent");
 assert("src/tools/l2g-gather.ts", gather, "createCodeModeError", "l2g_gather has error structuredContent path");
-assert("src/tools/l2g-gather.ts", gather, "stageToDoAndRespond", "l2g_gather stages results to DO");
+assert("src/lib/gather-result.ts", read("src/lib/gather-result.ts"), "stageToDoAndRespond", "l2g_gather stages results to DO");
 assert("src/tools/l2g-gather.ts", gather, "Promise.all", "l2g_gather uses Promise.all for parallel fan-out");
 assert("src/tools/l2g-gather.ts", gather, "withDeadline", "l2g_gather has per-stage deadline guards");
 assert("src/tools/l2g-gather.ts", gather, "projected > 800", "l2g_gather enforces subrequest budget");

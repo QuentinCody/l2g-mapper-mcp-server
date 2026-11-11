@@ -8,6 +8,7 @@
  *      inlined under the appropriate sections.
  */
 
+import { readCompleteTable } from "../lib/complete-table";
 import type { McpServer } from "@bio-mcp/shared/mcp";
 import { z } from "zod";
 import {
@@ -24,6 +25,16 @@ import {
 	type TissueDot,
 } from "../lib/mermaid";
 import { verifySectionOrder } from "../lib/qc";
+import { EVIDENCE_LIMITATIONS, EVIDENCE_POLICY_VERSION } from "../lib/evidence-policy";
+import { l2gResponse } from "../lib/tool-result";
+import { synthesisEvidence } from "../lib/synthesis-evidence";
+import { loadGnomadContext } from "../lib/gnomad-synthesis";
+import { loadFinnGenContext } from "../lib/finngen-synthesis";
+import { loadHpaContext } from "../lib/hpa-synthesis";
+import { loadGenebassContext } from "../lib/genebass-synthesis";
+import { loadClinvarContext } from "../lib/clinvar-synthesis";
+import { loadEqtlCatalogueContext } from "../lib/eqtl-catalogue-synthesis";
+import { loadEqtlR8Observation, r8SynthesisContext } from "../lib/eqtl-r8-synthesis";
 
 interface SynthEnv {
 	L2G_DATA_DO?: DurableObjectNamespace;
@@ -41,6 +52,7 @@ interface MetaRow {
 	sources_queried: string | null;
 	target_gene: string | null;
 	warnings_json: string | null;
+	caps_json?: string | null;
 }
 interface AnchorRow {
 	rsid: string;
@@ -53,11 +65,16 @@ interface AnchorRow {
 	grch38_alt?: string | null;
 }
 interface ScoredRow {
+	evidence_policy_version?: string;
 	locus_id: string;
 	lead_rsid: string;
 	symbol: string;
 	ensembl_id: string | null;
 	l2g_max: number;
+	l2g_support_json?: string | null;
+	coloc_support_json?: string | null;
+	eqtl_support_json?: string | null;
+	burden_support_json?: string | null;
 	coloc_max_h4: number | null;
 	coloc_max_clpp: number | null;
 	eqtl_tissue_hits: number;
@@ -75,23 +92,30 @@ interface ScoredRow {
 }
 interface CrossRow {
 	symbol: string;
+	ensembl_id: string | null;
 	supporting_loci: number;
 	mean_score: number;
 	max_score: number;
 }
 
-async function safeQuery<T>(doNs: DurableObjectNamespace, id: string, sql: string): Promise<T[]> {
-	try {
-		const res = await queryDataFromDo(doNs, id, sql, 10_000);
-		return res.rows as T[];
-	} catch {
-		return [];
-	}
+async function readComplete<T>(doNs: DurableObjectNamespace, id: string, sql: string): Promise<T[]> {
+	const res = await queryDataFromDo(doNs, id, sql, 10_000);
+	if (res.truncated || res.count_capped || (res.total_matching != null && res.total_matching > res.rows.length)) throw new Error("Synthesis requires complete staged input tables; the SQL read was capped.");
+	return res.rows as T[];
 }
 
 function parsePipe(value: string | null | undefined): string[] {
 	if (!value) return [];
 	return value.split("|").map((s) => s.trim()).filter((s) => s.length > 0);
+}
+
+function parseWarnings(value: string | null): string[] {
+	try {
+		const parsed: unknown = JSON.parse(value ?? "[]");
+		return Array.isArray(parsed) ? parsed.map(String) : [];
+	} catch {
+		return [];
+	}
 }
 
 export function registerL2gSynthesize(server: McpServer, env?: SynthEnv): void {
@@ -106,10 +130,10 @@ export function registerL2gSynthesize(server: McpServer, env?: SynthEnv): void {
 
 		try {
 			const [metaRows, anchorRows, scoredRows, crossRows] = await Promise.all([
-				safeQuery<MetaRow>(doNs, dataAccessId, "SELECT * FROM l2g_meta"),
-				safeQuery<AnchorRow>(doNs, dataAccessId, "SELECT * FROM anchors"),
-				safeQuery<ScoredRow>(doNs, dataAccessId, "SELECT * FROM scored_candidate_genes ORDER BY overall_score DESC"),
-				safeQuery<CrossRow>(doNs, dataAccessId, "SELECT * FROM cross_locus_ranked_genes ORDER BY supporting_loci DESC, max_score DESC"),
+				readComplete<MetaRow>(doNs, dataAccessId, "SELECT * FROM l2g_meta"),
+				readComplete<AnchorRow>(doNs, dataAccessId, "SELECT * FROM anchors"),
+				readCompleteTable<ScoredRow>(doNs, dataAccessId, "scored_candidate_genes", "SELECT * FROM scored_candidate_genes ORDER BY overall_score DESC"),
+				readComplete<CrossRow>(doNs, dataAccessId, "SELECT * FROM cross_locus_ranked_genes ORDER BY supporting_loci DESC, max_score DESC"),
 			]);
 
 			if (scoredRows.length === 0) {
@@ -119,6 +143,9 @@ export function registerL2gSynthesize(server: McpServer, env?: SynthEnv): void {
 				);
 			}
 
+			if (scoredRows.some((row) => row.evidence_policy_version !== EVIDENCE_POLICY_VERSION)) {
+				return createCodeModeError("DATA_ACCESS_ERROR", "Stored scores use an older evidence policy. Re-run l2g_score before synthesis.");
+			}
 			const meta = metaRows[0] ?? {
 				trait_query: null,
 				efo_id: null,
@@ -129,9 +156,19 @@ export function registerL2gSynthesize(server: McpServer, env?: SynthEnv): void {
 				warnings_json: null,
 			};
 
-			// ── Build JSON contract per SKILL.md ────────────────────────────
+			const gnomadContext = await loadGnomadContext(doNs, dataAccessId, meta.caps_json, parsePipe(meta.sources_queried).includes("gnomad"));
+			const finngenContext = await loadFinnGenContext(doNs, dataAccessId, meta.caps_json, anchorRows);
+			const hpaContext = await loadHpaContext(doNs, dataAccessId, meta.caps_json, parsePipe(meta.sources_queried).includes("hpa"));
+			const genebassContext = await loadGenebassContext(doNs, dataAccessId, meta.caps_json, parsePipe(meta.sources_queried).includes("genebass"));
+			const clinvarContext = await loadClinvarContext(doNs, dataAccessId, meta.caps_json, parsePipe(meta.sources_queried).includes("clinvar"));
+			const eqtlCatalogueContext = await loadEqtlCatalogueContext(doNs, dataAccessId, meta.caps_json, anchorRows);
+			const eqtlR8Context = r8SynthesisContext(await loadEqtlR8Observation(doNs, dataAccessId, meta.caps_json, anchorRows), dataAccessId);
 			const anchorsJson = anchorRows.map((a) => ({
 				rsid: a.rsid,
+				clinvar_context: clinvarContext.get(a.rsid) ?? [],
+				finngen_context: finngenContext.get(a.rsid) ?? [],
+				eqtl_catalogue_context: eqtlCatalogueContext.get(a.rsid) ?? [],
+				eqtl_catalogue_r8_context: eqtlR8Context.get(a.rsid) ?? [],
 				grch38: a.grch38_chr && a.grch38_pos
 					? { chr: a.grch38_chr, pos: a.grch38_pos, ref: a.grch38_ref, alt: a.grch38_alt }
 					: null,
@@ -141,58 +178,33 @@ export function registerL2gSynthesize(server: McpServer, env?: SynthEnv): void {
 			}));
 
 			// Group scored rows by locus
-			const byLocus = new Map<string, ScoredRow[]>();
-			for (const r of scoredRows) {
-				if (!byLocus.has(r.locus_id)) byLocus.set(r.locus_id, []);
-				byLocus.get(r.locus_id)?.push(r);
-			}
+			const byLocus = groupScoredLoci(scoredRows);
 			const loci = [...byLocus.entries()].map(([locus_id, rows]) => {
 				rows.sort((a, b) => b.overall_score - a.overall_score);
 				return {
 					locus_id,
 					lead_rsid: rows[0]?.lead_rsid ?? null,
+					lead_rsids: [...new Set(rows.map(r => r.lead_rsid))].sort(),
 					candidate_genes: rows.map((r) => ({
 						symbol: r.symbol,
 						ensembl_id: r.ensembl_id,
+						lead_rsid: r.lead_rsid,
 						overall_score: Number(r.overall_score.toFixed(4)),
 						confidence: r.confidence,
-						evidence: {
-							l2g_max: Number(r.l2g_max?.toFixed?.(4) ?? r.l2g_max ?? 0),
-							coloc_max_h4: r.coloc_max_h4,
-							coloc_max_clpp: r.coloc_max_clpp,
-							eqtl_tissues: parsePipe(r.eqtl_tissues),
-							rare_variant_support:
-								r.burden_best_p == null
-									? "none"
-									: r.burden_best_p < 2.5e-6
-										? "strong"
-										: r.burden_best_p < 0.05
-											? "nominal"
-											: "none",
-							coding_support: r.coding_support,
-							clinvar_support: r.clinvar_support,
-							gnomad_context: null,
-							hpa_tissue_support: [] as string[],
-						},
+						evidence: { ...synthesisEvidence(r, r.ensembl_id ? gnomadContext.get(r.ensembl_id) ?? null : null),
+							hpa_context: r.ensembl_id ? hpaContext.get(r.ensembl_id) ?? [] : [],
+							genebass_context: r.ensembl_id ? genebassContext.get(r.ensembl_id) ?? [] : [] },
 						rationale: buildRationale(r),
 						limitations: buildLimitations(r),
 					})),
 				};
 			});
 
-			const warningsMeta: string[] = meta.warnings_json
-				? (() => {
-					try {
-						const parsed = JSON.parse(meta.warnings_json);
-						return Array.isArray(parsed) ? parsed.map(String) : [];
-					} catch {
-						return [];
-					}
-				})()
-				: [];
+			const warningsMeta = parseWarnings(meta.warnings_json);
 
 			const jsonContract = {
 				meta: {
+					evidence_policy_version: EVIDENCE_POLICY_VERSION,
 					trait_query: meta.trait_query,
 					efo_id: meta.efo_id,
 					efo_label: meta.efo_label,
@@ -203,46 +215,27 @@ export function registerL2gSynthesize(server: McpServer, env?: SynthEnv): void {
 				loci,
 				cross_locus_ranked_genes: crossRows.map((r) => ({
 					symbol: r.symbol,
+					ensembl_id: r.ensembl_id,
 					supporting_loci: r.supporting_loci,
 					mean_score: Number(r.mean_score.toFixed(4)),
 					max_score: Number(r.max_score.toFixed(4)),
 				})),
 				warnings: warningsMeta,
 				limitations: [
-					"coding_support is heuristic (L2G + ClinVar-derived) — synchronous L2G skips live VEP.",
+					...EVIDENCE_LIMITATIONS,
 					"Default synchronous caps: max_loci=8, max_anchor_associations=300; full-scope mode deferred (ADR-005).",
 				],
 			};
 
 			// ── Build Mermaid figures ──────────────────────────────────────
 			// Heatmap: top-8 cross-locus genes × 5 evidence components
-			const topGenes = crossRows.slice(0, 8).map((r) => r.symbol);
-			const heatmapRows = scoredRows
-				.filter((r) => topGenes.includes(r.symbol))
-				.reduce<Map<string, ScoredRow>>((m, r) => {
-					const curr = m.get(r.symbol);
-					if (!curr || r.overall_score > curr.overall_score) m.set(r.symbol, r);
-					return m;
-				}, new Map());
-			const heatmapCells: HeatmapCell[] = [];
-			for (const sym of topGenes) {
-				const r = heatmapRows.get(sym);
-				if (!r) continue;
-				heatmapCells.push({ row: sym, col: "L2G", value: r.l2g_component });
-				heatmapCells.push({ row: sym, col: "coloc", value: r.coloc_component });
-				heatmapCells.push({ row: sym, col: "eQTL", value: r.eqtl_component });
-				heatmapCells.push({ row: sym, col: "burden", value: r.burden_component });
-				heatmapCells.push({ row: sym, col: "coding", value: r.coding_component });
-			}
-			const heatmap = locusGeneHeatmap(heatmapCells);
-
-			const decompRows: LocusDecomposition[] = [];
+			const { decompRows, topGenes, heatmap } = buildSynthesisHeatmap(crossRows, scoredRows);
 			for (const [locus_id, rows] of byLocus) {
 				const top = rows[0];
 				if (!top) continue;
 				decompRows.push({
 					locus_id,
-					gene: top.symbol,
+					gene: `${top.symbol} (${top.ensembl_id ?? "unresolved"})`,
 					components: {
 						l2g: Number(top.l2g_component),
 						coloc: Number(top.coloc_component),
@@ -256,9 +249,9 @@ export function registerL2gSynthesize(server: McpServer, env?: SynthEnv): void {
 
 			const dots: TissueDot[] = [];
 			for (const r of scoredRows) {
-				if (!topGenes.includes(r.symbol)) continue;
+				if (!r.ensembl_id || !topGenes.includes(r.ensembl_id)) continue;
 				for (const tissue of parsePipe(r.eqtl_tissues)) {
-					dots.push({ gene: r.symbol, tissue, present: true });
+					dots.push({ gene: `${r.symbol} (${r.ensembl_id})`, tissue, present: true });
 				}
 			}
 			const dotplot = tissueSupportDotplot(dots);
@@ -299,7 +292,7 @@ export function registerL2gSynthesize(server: McpServer, env?: SynthEnv): void {
 			{
 				title: "L2G Synthesize Final Contract",
 				description:
-					"Stage 3 of the locus-to-gene composer. Pure read — no network. Emits the full " +
+					"Stage 3 of the locus-to-gene composer. Reads staged evidence without upstream requests; large outputs are staged. Emits the full " +
 					"SKILL.md JSON contract, the Markdown summary in exact section order (Objective, " +
 					"Inputs and scope, Anchor variant summary, Per-locus top genes, Cross-locus " +
 					"prioritized genes, Key caveats, Recommended next analyses), and three Mermaid " +
@@ -307,19 +300,55 @@ export function registerL2gSynthesize(server: McpServer, env?: SynthEnv): void {
 					"No PNGs — Mermaid only.",
 				inputSchema,
 			},
-			(args, extra) => handler(args as Record<string, unknown>, extra),
+			(args, extra) => l2gResponse(() => handler(args as Record<string, unknown>, extra), env || (extra as { env?: SynthEnv })?.env || {}, name, args, extra),
 		);
 
 	reg("mcp_l2g_synthesize");
 	reg("l2g_synthesize");
 }
 
+function groupScoredLoci(scoredRows: ScoredRow[]) {
+  const byLocus = new Map<string, ScoredRow[]>();
+  for (const r of scoredRows) {
+    if (!byLocus.has(r.locus_id)) byLocus.set(r.locus_id, []);
+    byLocus.get(r.locus_id)?.push(r);
+  }
+  return byLocus;
+}
+
+function buildSynthesisHeatmap(crossRows: CrossRow[], scoredRows: ScoredRow[]) {
+  const topGenes = crossRows.slice(0, 8).map((r) => r.ensembl_id).filter((id): id is string => Boolean(id));
+  const heatmapRows = scoredRows
+    .filter((r) => r.ensembl_id && topGenes.includes(r.ensembl_id))
+    .reduce<Map<string, ScoredRow>>((m, r) => {
+      const curr = m.get(r.ensembl_id!);
+      if (!curr || r.overall_score > curr.overall_score) m.set(r.ensembl_id!, r);
+      return m;
+    }, new Map());
+  const heatmapCells: HeatmapCell[] = [];
+  for (const sym of topGenes) {
+    const r = heatmapRows.get(sym);
+    if (!r) continue;
+    const label = `${r.symbol} (${sym})`;
+    heatmapCells.push({ row: label, col: "L2G", value: r.l2g_component });
+    heatmapCells.push({ row: label, col: "coloc", value: r.coloc_component });
+    heatmapCells.push({ row: label, col: "eQTL", value: r.eqtl_component });
+    heatmapCells.push({ row: label, col: "burden", value: r.burden_component });
+    heatmapCells.push({ row: label, col: "coding", value: r.coding_component });
+  }
+  const heatmap = locusGeneHeatmap(heatmapCells);
+
+  const decompRows: LocusDecomposition[] = [];
+  return { decompRows, topGenes, heatmap };
+}
+
 function buildRationale(r: ScoredRow): string[] {
 	const out: string[] = [];
 	if (r.l2g_max > 0) out.push(`OpenTargets L2G score ${r.l2g_max.toFixed(3)} (component ${r.l2g_component.toFixed(2)} × weight 0.40).`);
 	if (r.coloc_max_h4 != null) out.push(`Coloc h4=${r.coloc_max_h4.toFixed(3)} (component ${r.coloc_component.toFixed(2)} × weight 0.25).`);
+	else if (r.coloc_max_clpp != null) out.push(`eCAVIAR CLPP=${r.coloc_max_clpp.toFixed(3)} (component ${r.coloc_component.toFixed(2)} × weight 0.25).`);
 	if (r.eqtl_tissue_hits > 0) out.push(`GTEx single-tissue eQTL in ${r.eqtl_tissue_hits} tissue(s) (component ${r.eqtl_component.toFixed(2)} × weight 0.15).`);
-	if (r.burden_best_p != null) out.push(`Genebass burden best p=${r.burden_best_p.toExponential(2)} (component ${r.burden_component.toFixed(2)} × weight 0.10).`);
+	if (r.burden_best_p != null) out.push(`Open Targets exact-trait gene-burden best p=${r.burden_best_p.toExponential(2)} (component ${r.burden_component.toFixed(2)} before weighting).`);
 	if (r.coding_support !== "none" || r.clinvar_support !== "none") {
 		out.push(`Coding/ClinVar support: ${r.coding_support}/${r.clinvar_support} (component ${r.coding_component.toFixed(2)} × weight 0.10).`);
 	}
@@ -328,10 +357,10 @@ function buildRationale(r: ScoredRow): string[] {
 
 function buildLimitations(r: ScoredRow): string[] {
 	const out: string[] = [];
-	if (r.l2g_max === 0) out.push("No OpenTargets L2G score available for this gene at this locus.");
-	if (r.coloc_max_h4 == null && r.coloc_max_clpp == null) out.push("No colocalisation evidence available.");
-	if (r.eqtl_tissue_hits === 0) out.push("No GTEx single-tissue eQTL support.");
-	if (r.burden_best_p == null) out.push("No Genebass burden evidence retrieved.");
+	if (r.l2g_max === 0) out.push("No qualified Open Targets L2G contribution for this gene and anchor; this does not establish evidence absence.");
+	if (r.coloc_max_h4 == null && r.coloc_max_clpp == null) out.push("No qualified gene-specific colocalisation contribution; inspect the coloc context table.");
+	if (r.eqtl_tissue_hits === 0) out.push("No retrieved GTEx tissue support matched this gene ID and anchor; coverage is incomplete.");
+	if (r.burden_best_p == null) out.push("No qualified trait-specific burden contribution; inspect opentargets_evidence and the separate Genebass burden context.");
 	return out;
 }
 
@@ -339,8 +368,8 @@ function buildMarkdown(
 	json: {
 		meta: { trait_query: string | null; efo_id: string | null; efo_label: string | null; generated_at: string | null };
 		anchors: Array<{ rsid: string; p_value: number | null; lead_trait: string | null }>;
-		loci: Array<{ locus_id: string; lead_rsid: string | null; candidate_genes: Array<{ symbol: string; overall_score: number; confidence: string; evidence: { l2g_max: number; coloc_max_h4: number | null; eqtl_tissues: string[] } }> }>;
-		cross_locus_ranked_genes: Array<{ symbol: string; supporting_loci: number; mean_score: number; max_score: number }>;
+		loci: Array<{ locus_id: string; lead_rsid: string | null; lead_rsids: string[]; candidate_genes: Array<{ symbol: string; ensembl_id: string | null; lead_rsid: string; overall_score: number; confidence: string; evidence: { l2g_max: number; coloc_max_h4: number | null; coloc_max_clpp: number | null; eqtl_tissues: string[] } }> }>;
+		cross_locus_ranked_genes: Array<{ symbol: string; ensembl_id: string | null; supporting_loci: number; mean_score: number; max_score: number }>;
 		warnings: string[];
 		limitations: string[];
 	},
@@ -374,30 +403,7 @@ function buildMarkdown(
 	}
 	lines.push("");
 
-	lines.push("## Per-locus top genes");
-	lines.push("");
-	lines.push("```mermaid");
-	lines.push(decompMermaid);
-	lines.push("```");
-	lines.push("");
-	if (json.loci.length === 0) {
-		lines.push("No loci available.");
-	} else {
-		for (const locus of json.loci) {
-			lines.push(`### ${locus.locus_id} (lead \`${locus.lead_rsid ?? "."}\`)`);
-			if (locus.candidate_genes.length === 0) {
-				lines.push("- No candidate genes scored.");
-				continue;
-			}
-			for (const g of locus.candidate_genes.slice(0, 5)) {
-				const l2g = g.evidence.l2g_max.toFixed(3);
-				const coloc = typeof g.evidence.coloc_max_h4 === "number" ? g.evidence.coloc_max_h4.toFixed(3) : ".";
-				const tissues = g.evidence.eqtl_tissues.filter((t) => t && t !== ".").length;
-				lines.push(`- \`${g.symbol}\` | score=${g.overall_score.toFixed(3)} (${g.confidence}) | L2G=${l2g} | coloc=${coloc} | eQTL tissues=${tissues}`);
-			}
-		}
-	}
-	lines.push("");
+	appendLocusMarkdown(lines, decompMermaid, json);
 
 	lines.push("## Cross-locus prioritized genes");
 	lines.push("");
@@ -413,7 +419,7 @@ function buildMarkdown(
 		lines.push("No cross-locus aggregated ranking available.");
 	} else {
 		for (const r of json.cross_locus_ranked_genes.slice(0, 15)) {
-			lines.push(`- \`${r.symbol}\` | supporting_loci=${r.supporting_loci} | mean_score=${r.mean_score.toFixed(3)} | max_score=${r.max_score.toFixed(3)}`);
+			lines.push(`- \`${r.symbol}\` (${r.ensembl_id ?? "unresolved gene ID"}) | supporting_loci=${r.supporting_loci} | mean_score=${r.mean_score.toFixed(3)} | max_score=${r.max_score.toFixed(3)}`);
 		}
 	}
 	lines.push("");
@@ -434,4 +440,31 @@ function buildMarkdown(
 	lines.push("- Consider the deferred full-scope L2G mode (ADR-005) for 1200-anchor / 25-loci runs.");
 
 	return lines.join("\n");
+}
+
+function appendLocusMarkdown(lines: string[], decompMermaid: string, json: Parameters<typeof buildMarkdown>[0]) {
+  lines.push("## Per-locus top genes");
+  lines.push("");
+  lines.push("```mermaid");
+  lines.push(decompMermaid);
+  lines.push("```");
+  lines.push("");
+  if (json.loci.length === 0) {
+    lines.push("No loci available.");
+  } else {
+    for (const locus of json.loci) {
+      lines.push(`### ${locus.locus_id} (anchors: ${locus.lead_rsids.map(rsid => `\`${rsid}\``).join(", ")})`);
+      if (locus.candidate_genes.length === 0) {
+        lines.push("- No candidate genes scored.");
+        continue;
+      }
+      for (const g of locus.candidate_genes.slice(0, 5)) {
+        const l2g = g.evidence.l2g_max.toFixed(3);
+        const coloc = typeof g.evidence.coloc_max_h4 === "number" ? `H4:${g.evidence.coloc_max_h4.toFixed(3)}` : typeof g.evidence.coloc_max_clpp === "number" ? `CLPP:${g.evidence.coloc_max_clpp.toFixed(3)}` : ".";
+        const tissues = g.evidence.eqtl_tissues.filter((t) => t && t !== ".").length;
+        lines.push(`- \`${g.symbol}\` (${g.ensembl_id ?? "unresolved"}; anchor ${g.lead_rsid}) | score=${g.overall_score.toFixed(3)} (${g.confidence}) | L2G=${l2g} | coloc=${coloc} | eQTL tissues=${tissues}`);
+      }
+    }
+  }
+  lines.push("");
 }

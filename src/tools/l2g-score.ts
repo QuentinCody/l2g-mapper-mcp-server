@@ -18,19 +18,28 @@ import {
 } from "@bio-mcp/shared/codemode/response";
 import { queryDataFromDo } from "@bio-mcp/shared/staging/utils";
 import {
-	burdenComponent,
-	codingComponent,
-	colocComponent,
 	computeScore,
 	confidenceLabel,
-	eqtlComponent,
-	l2gComponent,
 	WEIGHTS,
 	type CodingSupport,
 	type ClinvarSupport,
 	type ScoreBreakdown,
 } from "../lib/scoring";
 import { runScoringQc } from "../lib/qc";
+import { EVIDENCE_LIMITATIONS, EVIDENCE_POLICY_VERSION, GATHER_POLICY_VERSION } from "../lib/evidence-policy";
+import { l2gGeneKey, qualifiedL2gScores } from "../lib/qualified-l2g";
+import type { L2gPredictionRow, ColocRow } from "../lib/opentargets-contract";
+import { qualifiedColocScores } from "../lib/qualified-coloc";
+import { crossLocusRanking } from "../lib/cross-locus-ranking";
+import { l2gResponse } from "../lib/tool-result";
+import { loadGtexSupport } from "../lib/gtex-scoring";
+import { gtexGeneKey } from "../lib/gtex-qualified";
+import { loadBurdenSupport } from "../lib/burden-scoring";
+import { loadEqtlCatalogueObservation, type StagedAnchor } from "../lib/eqtl-catalogue-synthesis";
+import { qualifiedCatalogue } from "../lib/eqtl-catalogue-qualified";
+import { loadEqtlR8Observation } from "../lib/eqtl-r8-synthesis";
+import { qualifiedR8Catalogue } from "../lib/eqtl-r8-qualified";
+import { mergeEqtlSupport } from "../lib/eqtl-support";
 
 interface ScoreEnv {
 	L2G_DATA_DO?: DurableObjectNamespace;
@@ -62,41 +71,15 @@ interface CandidateRow {
 	symbol: string;
 	ensembl_id: string | null;
 }
-interface L2gRow {
-	locus_id: string;
-	symbol: string;
-	score: number;
-}
-interface ColocRow {
-	locus_id: string;
-	h4: number | null;
-	clpp: number | null;
-}
-interface EqtlRow {
-	lead_rsid: string;
-	symbol: string;
-	tissue: string;
-}
-interface BurdenRow {
-	symbol: string;
-	p_value: number | null;
-}
-interface ClinvarRow {
-	rsid: string;
-	clinical_significance: string | null;
-}
 
 async function selectAll<T>(
 	doNamespace: DurableObjectNamespace,
 	dataAccessId: string,
 	sql: string,
 ): Promise<T[]> {
-	try {
-		const { rows } = await queryDataFromDo(doNamespace, dataAccessId, sql, 10_000);
-		return rows as T[];
-	} catch {
-		return [];
-	}
+	const result = await queryDataFromDo(doNamespace, dataAccessId, sql, 10_000);
+	if (result.truncated || result.count_capped || (result.total_matching != null && result.total_matching > result.rows.length)) throw new Error("Scoring requires complete staged input tables; the SQL read was capped.");
+	return result.rows as T[];
 }
 
 /**
@@ -109,7 +92,7 @@ async function selectAll<T>(
 async function preflightDao(
 	doNamespace: DurableObjectNamespace,
 	dataAccessId: string,
-): Promise<{ ok: boolean; message: string }> {
+): Promise<{ ok: boolean; message: string; tables?: string[]; selectedTrait?: string | null }> {
 	try {
 		const doId = doNamespace.idFromName(dataAccessId);
 		const doInstance = doNamespace.get(doId);
@@ -149,7 +132,12 @@ async function preflightDao(
 				message: `data_access_id=${dataAccessId} is populated but has no anchors table (found: ${userTables.join(", ")}). The gather phase produced no anchor variants — revise trait_query/seed_rsids and re-run l2g_gather.`,
 			};
 		}
-		return { ok: true, message: "" };
+		const meta = await queryDataFromDo(doNamespace, dataAccessId, "SELECT * FROM l2g_meta", 2);
+		const row = meta.rows[0] as { gather_policy_version?: string; efo_id?: string | null } | undefined;
+		if (meta.rows.length !== 1 || row?.gather_policy_version !== GATHER_POLICY_VERSION) {
+			return { ok: false, message: "Stored gather predates the current allele/trait/candidate qualification. Re-run l2g_gather before scoring." };
+		}
+		return { ok: true, message: "", tables: userTables, selectedTrait: row.efo_id ?? null };
 	} catch (err) {
 		const msg = err instanceof Error ? err.message : String(err);
 		return { ok: false, message: `Preflight failed: ${msg}` };
@@ -195,116 +183,56 @@ export function registerL2gScore(server: McpServer, env?: ScoreEnv): void {
 				dataAccessId,
 				"SELECT locus_id, lead_rsid, symbol, ensembl_id FROM candidate_genes",
 			);
-			const l2gRows = await selectAll<L2gRow>(
+			const l2gRows = preflight.tables?.includes("l2g_predictions") ? await selectAll<L2gPredictionRow>(
 				doNamespace,
 				dataAccessId,
-				"SELECT locus_id, symbol, score FROM l2g_predictions",
-			);
-			const colocRows = await selectAll<ColocRow>(
-				doNamespace,
-				dataAccessId,
-				"SELECT locus_id, h4, clpp FROM coloc",
-			);
-			const eqtlRows = await selectAll<EqtlRow>(
-				doNamespace,
-				dataAccessId,
-				"SELECT lead_rsid, symbol, tissue FROM eqtl",
-			);
-			const burdenRows = await selectAll<BurdenRow>(
-				doNamespace,
-				dataAccessId,
-				"SELECT symbol, p_value FROM burden",
-			);
-			const clinvarRows = await selectAll<ClinvarRow>(
-				doNamespace,
-				dataAccessId,
-				"SELECT rsid, clinical_significance FROM clinvar",
-			);
+				"SELECT * FROM l2g_predictions",
+			) : [];
+			const gtex = await loadGtexSupport(doNamespace, dataAccessId, preflight.tables);
+            const catalogueInput = await loadEqtlCatalogueObservation(doNamespace, dataAccessId, gtex.caps_json, gtex.anchors as unknown as StagedAnchor[]);
+            const r8Input = await loadEqtlR8Observation(doNamespace, dataAccessId, gtex.caps_json, gtex.anchors as unknown as StagedAnchor[]);
+            const catalogue = catalogueInput ? qualifiedCatalogue(catalogueInput.native, catalogueInput.row, catalogueInput.indexes, dataAccessId) : qualifiedR8Catalogue(r8Input, dataAccessId);
+            const burden = await loadBurdenSupport(doNamespace, dataAccessId, preflight.tables, preflight.selectedTrait);
 
-			// Build per-(locus, symbol) aggregates
+			const colocRows = preflight.tables?.includes("coloc") ? await selectAll<ColocRow>(doNamespace, dataAccessId, "SELECT * FROM coloc") : [];
+			const qualifiedColoc = qualifiedColocScores(colocRows, l2gRows, preflight.selectedTrait ?? null);
+			// Build per-(locus, anchor, Ensembl ID) aggregates
 			interface ScoredRow {
 				locus_id: string;
 				lead_rsid: string;
 				symbol: string;
 				ensembl_id: string | null;
 				l2g_max: number;
+				l2g_support_json: string;
+				coloc_support_json: string;
 				coloc_max_h4: number | null;
 				coloc_max_clpp: number | null;
 				eqtl_tissue_hits: number;
 				eqtl_tissues_pipe: string;
+				eqtl_support_json: string;
 				burden_best_p: number | null;
+                burden_support_json: string;
 				coding_support: CodingSupport;
 				clinvar_support: ClinvarSupport;
 				score: ScoreBreakdown;
 			}
 
-			// l2g_max per (locus_id, symbol)
-			const l2gMax = new Map<string, number>();
-			for (const r of l2gRows) {
-				const key = `${r.locus_id}::${r.symbol}`;
-				if (!l2gMax.has(key) || (r.score ?? 0) > (l2gMax.get(key) ?? 0)) l2gMax.set(key, Number(r.score ?? 0));
-			}
-
-			// coloc_max_h4 per locus (coloc isn't gene-specific in OT schema we used)
-			const colocMaxH4 = new Map<string, number>();
-			const colocMaxClpp = new Map<string, number>();
-			for (const r of colocRows) {
-				if (r.h4 != null) {
-					const curr = colocMaxH4.get(r.locus_id) ?? 0;
-					if (r.h4 > curr) colocMaxH4.set(r.locus_id, Number(r.h4));
-				}
-				if (r.clpp != null) {
-					const curr = colocMaxClpp.get(r.locus_id) ?? 0;
-					if (r.clpp > curr) colocMaxClpp.set(r.locus_id, Number(r.clpp));
-				}
-			}
-
-			// eQTL tissues per (lead_rsid, symbol)
-			const eqtlTissues = new Map<string, Set<string>>();
-			for (const r of eqtlRows) {
-				const key = `${r.lead_rsid}::${r.symbol}`;
-				if (!eqtlTissues.has(key)) eqtlTissues.set(key, new Set());
-				const set = eqtlTissues.get(key);
-				if (set && r.tissue && r.tissue !== ".") set.add(r.tissue);
-			}
-
-			// Burden best p per symbol
-			const burdenBestP = new Map<string, number>();
-			for (const r of burdenRows) {
-				if (r.p_value == null) continue;
-				const curr = burdenBestP.get(r.symbol);
-				if (curr == null || r.p_value < curr) burdenBestP.set(r.symbol, Number(r.p_value));
-			}
-
-			// ClinVar support per rsid: "present" if any pathogenic-ish significance present
-			const clinvarSupport = new Map<string, ClinvarSupport>();
-			for (const r of clinvarRows) {
-				const sig = (r.clinical_significance ?? "").toLowerCase();
-				if (sig.includes("pathogenic") || sig.includes("likely")) {
-					clinvarSupport.set(r.rsid, "present");
-				} else if (!clinvarSupport.has(r.rsid)) {
-					clinvarSupport.set(r.rsid, "none");
-				}
-			}
-
-			// For coding support we have no VEP fetch in this plan. Approximate:
-			// coding=coding if l2g_max >= 0.6 AND clinvar_support==="present"; else noncoding if
-			// l2g_max >= 0.5; else none. (Conservative heuristic noted in the rationale.)
-			const codingGuess = (l2g: number, clinvar: ClinvarSupport): CodingSupport => {
-				if (clinvar === "present" && l2g >= 0.6) return "coding";
-				if (l2g >= 0.5) return "noncoding";
-				return "none";
-			};
+			const qualified = qualifiedL2gScores(l2gRows, preflight.selectedTrait ?? null);
 
 			const scored: ScoredRow[] = [];
 			for (const cg of candidates) {
-				const l2g_max = l2gMax.get(`${cg.locus_id}::${cg.symbol}`) ?? 0;
-				const coloc_h4 = colocMaxH4.get(cg.locus_id) ?? null;
-				const coloc_clpp = colocMaxClpp.get(cg.locus_id) ?? null;
-				const tissues = eqtlTissues.get(`${cg.lead_rsid}::${cg.symbol}`) ?? new Set<string>();
-				const best_p = burdenBestP.get(cg.symbol) ?? null;
-				const clinvar = clinvarSupport.get(cg.lead_rsid) ?? "none";
-				const coding = codingGuess(l2g_max, clinvar);
+				const support = cg.ensembl_id ? qualified.scores.get(l2gGeneKey(cg)) : undefined;
+				const l2g_max = support?.score ?? 0;
+				// Context tables remain queryable; unqualified rows cannot support a gene score.
+				const colocSupport = qualifiedColoc.scores.get(l2gGeneKey(cg));
+				const coloc_h4 = colocSupport?.h4?.value ?? null;
+				const coloc_clpp = colocSupport?.clpp?.value ?? null;
+				const eqtlSupport = mergeEqtlSupport(gtex.support.get(gtexGeneKey(cg)), catalogue.get(gtexGeneKey(cg)));
+				const tissues = eqtlSupport.tissues;
+                const burdenSupport = cg.ensembl_id ? burden.support.get(cg.ensembl_id) : undefined;
+				const best_p = burdenSupport?.p_value ?? null;
+				const clinvar = "none";
+				const coding = "none";
 				const breakdown = computeScore(
 					{
 						l2g_max,
@@ -323,10 +251,14 @@ export function registerL2gScore(server: McpServer, env?: ScoreEnv): void {
 					symbol: cg.symbol,
 					ensembl_id: cg.ensembl_id,
 					l2g_max,
+					l2g_support_json: JSON.stringify(support ?? null),
+					coloc_support_json: JSON.stringify(colocSupport ?? null),
 					coloc_max_h4: coloc_h4,
 					coloc_max_clpp: coloc_clpp,
 					eqtl_tissue_hits: tissues.size,
 					eqtl_tissues_pipe: [...tissues].join(" | "),
+					eqtl_support_json: JSON.stringify(eqtlSupport?.references ?? []),
+					burden_support_json: JSON.stringify(burdenSupport?.references ?? []),
 					burden_best_p: best_p,
 					coding_support: coding,
 					clinvar_support: clinvar,
@@ -356,37 +288,24 @@ export function registerL2gScore(server: McpServer, env?: ScoreEnv): void {
 			}
 
 			// Build cross-locus ranking
-			const symbolAgg = new Map<string, { loci: Set<string>; max: number; sum: number; count: number }>();
-			for (const r of scored) {
-				const agg = symbolAgg.get(r.symbol) ?? { loci: new Set<string>(), max: 0, sum: 0, count: 0 };
-				agg.loci.add(r.locus_id);
-				agg.max = Math.max(agg.max, r.score.overall_score);
-				agg.sum += r.score.overall_score;
-				agg.count += 1;
-				symbolAgg.set(r.symbol, agg);
-			}
-			const crossLocus = [...symbolAgg.entries()].map(([symbol, agg]) => ({
-				symbol,
-				supporting_loci: agg.loci.size,
-				mean_score: agg.count > 0 ? agg.sum / agg.count : 0,
-				max_score: agg.max,
-			})).sort((a, b) =>
-				b.supporting_loci !== a.supporting_loci
-					? b.supporting_loci - a.supporting_loci
-					: b.max_score - a.max_score,
-			);
+			const crossLocus = crossLocusRanking(scored);
 
 			// Write scored_candidate_genes + cross_locus_ranked_genes back into the DO
 			const scoredFlat = scored.map((r) => ({
+				evidence_policy_version: EVIDENCE_POLICY_VERSION,
 				locus_id: r.locus_id,
 				lead_rsid: r.lead_rsid,
 				symbol: r.symbol,
 				ensembl_id: r.ensembl_id,
 				l2g_max: r.l2g_max,
+				l2g_support_json: r.l2g_support_json,
+				coloc_support_json: r.coloc_support_json,
 				coloc_max_h4: r.coloc_max_h4,
 				coloc_max_clpp: r.coloc_max_clpp,
 				eqtl_tissue_hits: r.eqtl_tissue_hits,
 				eqtl_tissues: r.eqtl_tissues_pipe,
+				eqtl_support_json: r.eqtl_support_json,
+				burden_support_json: r.burden_support_json,
 				burden_best_p: r.burden_best_p,
 				coding_support: r.coding_support,
 				clinvar_support: r.clinvar_support,
@@ -429,11 +348,13 @@ export function registerL2gScore(server: McpServer, env?: ScoreEnv): void {
 			const perLocusTopArr = [...perLocusTop.values()].map((r) => ({
 				locus_id: r.locus_id,
 				symbol: r.symbol,
+				ensembl_id: r.ensembl_id,
 				score: Number(r.overall_score.toFixed(4)),
 				confidence: r.confidence,
 			}));
 			const top5 = crossLocus.slice(0, 5).map((r) => ({
 				symbol: r.symbol,
+				ensembl_id: r.ensembl_id,
 				supporting_loci: r.supporting_loci,
 				mean_score: Number(r.mean_score.toFixed(4)),
 				max_score: Number(r.max_score.toFixed(4)),
@@ -446,7 +367,8 @@ export function registerL2gScore(server: McpServer, env?: ScoreEnv): void {
 					top_5_cross_locus: top5,
 					per_locus_top_gene: perLocusTopArr,
 					qc_passed: true,
-					warnings: qc.warnings,
+					evidence_policy_version: EVIDENCE_POLICY_VERSION,
+					warnings: [...qc.warnings, ...EVIDENCE_LIMITATIONS, ...gtex.warnings, ...burden.warnings, ...(qualified.excluded ? [`${qualified.excluded} unqualified Open Targets rows excluded from scoring.`] : []), ...(qualifiedColoc.excluded ? [`${qualifiedColoc.excluded} unqualified colocalisation rows excluded from scoring.`] : [])],
 					next_step: `Call l2g_synthesize with data_access_id='${dataAccessId}' to emit the full JSON+Markdown contract.`,
 				},
 				{
@@ -469,10 +391,11 @@ export function registerL2gScore(server: McpServer, env?: ScoreEnv): void {
 					"Stage 2 of the locus-to-gene composer. Pure SQL over the staged gather tables — " +
 					"no network. Applies the SKILL.md scoring formula: overall = 0.40*l2g + 0.25*coloc + " +
 					"0.15*eqtl + 0.10*burden + 0.10*coding. Writes scored_candidate_genes and " +
-					"cross_locus_ranked_genes back into the DO. Runs SKILL.md Phase-5 QC gates.",
+					"cross_locus_ranked_genes back into the DO. Unqualified coloc, burden and coding " +
+					"contributions are zero; source context remains queryable. Confidence is heuristic.",
 				inputSchema,
 			},
-			(args, extra) => handler(args as Record<string, unknown>, extra),
+			(args, extra) => l2gResponse(() => handler(args as Record<string, unknown>, extra), env || (extra as { env?: ScoreEnv })?.env || {}, name, args, extra),
 		);
 
 	reg("mcp_l2g_score");
